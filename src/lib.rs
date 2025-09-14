@@ -1,9 +1,7 @@
-use macroquad::prelude::*;
-use quad_rand as rand;
 use std::collections::VecDeque;
 
-struct PiBT {
-    grid: Vec<Vec<usize>>,
+pub struct PiBT {
+    pub grid: Vec<Vec<usize>>,
     q: Vec<Vec<(i64, i64)>>,
     dist: Vec<Vec<Vec<i64>>>,
     other_agents: Vec<Vec<Vec<Option<usize>>>>,
@@ -122,6 +120,7 @@ impl PiBT {
     /// - agent: usize
     /// - time: usize
     fn pibt(&mut self, agent: usize, time: usize) {
+        // (Agent, items to reserve in stack)
         let mut stack: Vec<(usize, Vec<(usize, usize, usize)>)> = vec![(agent, vec![])];
 
         while let Some((agent, to_reserve)) = stack.pop() {
@@ -131,6 +130,7 @@ impl PiBT {
                 self.q[time + 1][*agent] = (*x as i64, *y as i64);
             }
 
+            // Get neighbours
             let q_from = self.q[time][agent];
             let mut neighbor: smallvec::SmallVec<[(i64, i64); 4]> =
                 [(1, 0), (0, 1), (0, -1), (-1, 0)]
@@ -200,41 +200,66 @@ impl PiBT {
     }
 }
 
-#[macroquad::main("Movement Visualization")]
-async fn main() {
-    let problem = vec![vec![(0, 0), (1, 0), (1, 1)], vec![(2, 0), (2, 1), (2, 2)]];
+pub fn parse_grid(file_name: &str) -> Vec<Vec<usize>> {
+    let content = std::fs::read_to_string(file_name).expect("Failed to read the file");
+    let mut grid = Vec::new();
+    let mut lines = content.lines();
 
-    let mut solver = PiBT::init_empty_world(10, 10);
-    let trajectories = solver.solve(&problem[0], &problem[1], 20).unwrap();
+    // Skip the header lines
+    lines.next(); // type octile
+    lines.next(); // height
+    lines.next(); // width
+    lines.next(); // map
 
-    let mut agent_colors = vec![];
-    for _ in 0..problem[0].len() {
-        let r = rand::gen_range(0.0, 1.0);
-        let g = rand::gen_range(0.0, 1.0);
-        let b = rand::gen_range(0.0, 1.0);
-
-        agent_colors.push(Color::new(r, g, b, 1.0));
-    }
-
-    let mut last_update = std::time::SystemTime::now();
-    let mut time = 0;
-    loop {
-        clear_background(BLACK);
-
-        for agent in 0..trajectories[time].len() {
-            let pos = trajectories[time][agent];
-            let (x, y) = (pos.0 as f32 * 20.0, pos.1 as f32 * 20.0);
-            draw_circle(x + 10.0, y + 10.0, 10.0, agent_colors[agent]);
-        }
-
-        if last_update.elapsed().unwrap().as_secs_f64() > 1.0 {
-            time += 1;
-            if time >= trajectories.len() {
-                time = 0;
+    for line in lines {
+        let mut row = Vec::new();
+        for char in line.chars() {
+            match char {
+                '.' => row.push(0),
+                '@' => row.push(1),
+                _ => continue,
             }
-            last_update = std::time::SystemTime::now();
         }
+        if !row.is_empty() {
+            grid.push(row);
+        }
+    }
+    grid
+}
 
-        next_frame().await
+pub fn parse_scen(file_name: &str) -> Result<Vec<Vec<(usize, usize)>>, std::num::ParseIntError> {
+    let content = std::fs::read_to_string(file_name).expect("Failed to read the file");
+    let mut lines = content.lines();
+
+    lines.next();
+
+    let mut starts = vec![];
+    let mut ends = vec![];
+    for line in lines {
+        let pts: Vec<_> = line.split_ascii_whitespace().collect();
+
+        let start_x: usize = pts[4].parse()?;
+        let start_y: usize = pts[5].parse()?;
+        let end_x: usize = pts[6].parse()?;
+        let end_y: usize = pts[7].parse()?;
+
+        starts.push((start_x, start_y));
+        ends.push((end_x, end_y));
+    }
+    Ok(vec![starts, ends])
+}
+
+struct CollisionChecker {
+    grid_sizes: Vec<usize>,
+}
+
+impl CollisionChecker {
+    /// Gets the other blocked node
+    fn get_blocked_nodes(&self, grid_id: usize, x: usize, y: usize) -> Vec<(usize, usize, usize)> {
+        vec![]
     }
 }
+
+struct CBSPiBT {}
+
+impl CBSPiBT {}
