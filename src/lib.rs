@@ -310,10 +310,178 @@ impl MultiGridCollisionChecker {
     }
 }
 
+struct HeterogenousTrajectory {
+    graph_id: usize,
+    start_time: usize,
+    positions: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReservationError {
+    GraphNotFound,
+    OutOfGraphBounds(usize, usize, usize),
+    TrajectoryForAgentAlreadyExists,
+    ExceedMaxAgents
+}
+
+/// A Spatio-temporal reservation system.
+struct HeterogenousReservationSystem {
+    collision_checker: MultiGridCollisionChecker,
+    grid_bounds: Vec<(usize, usize)>,
+    occupied: Vec<Vec<Vec<Vec<Vec<usize>>>>>, // time, graph_id, x, y, agents - Multiple agents can occupy a single cell as we need to take into account agents
+    agent_to_cells: Vec<Vec<Vec<(usize, usize, usize)>>>, // For book keeping when we need to rollback. Format is [time][agent_id][cells_affected]
+    max_agents: usize
+}
+
+impl HeterogenousReservationSystem {
+    /// Attempts to add a trajectory to the list of trajectories
+    /// returns an error if the trajectories are out of the bounds of the managed space-time
+    /// returns true if the trajectory if the trajectories are
+    fn reserve_trajectory(
+        &mut self,
+        trajectory: &HeterogenousTrajectory,
+        agent_id: usize,
+    ) -> Result<bool, ReservationError> {
+        if agent_id >= self.max_agents {
+            return Err(ReservationError::ExceedMaxAgents);
+        }
+        for (time_after_start, &position) in trajectory.positions.iter().enumerate() {
+            let time = time_after_start + trajectory.start_time;
+            if time >= self.occupied.len() {
+                break;
+            }
+            if self.occupied[time].len() < trajectory.graph_id {
+                return Err(ReservationError::GraphNotFound);
+            }
+            let (x, y) = position;
+            if self.occupied[time][trajectory.graph_id].len() < x {
+                return Err(ReservationError::OutOfGraphBounds(
+                    trajectory.graph_id,
+                    x,
+                    y,
+                ));
+            }
+            if self.occupied[time][trajectory.graph_id][x].len() < y {
+                return Err(ReservationError::OutOfGraphBounds(
+                    trajectory.graph_id,
+                    x,
+                    y,
+                ));
+            }
+
+            if let Some(_) = self.occupied[time][trajectory.graph_id][x][y].first() {
+                // Spot is occupied
+                return Ok(false);
+            }
+
+            // Handle swap
+            if time_after_start == 0 {
+                // We only check for swaps after they occur
+                continue;
+            }
+
+            let (from_x, from_y) = trajectory.positions[time_after_start - 1];
+            for &agent in &self.occupied[time][trajectory.graph_id][from_x][from_y] {
+                for &agent_2 in &self.occupied[time - 1][trajectory.graph_id][x][y] {
+                    if agent == agent_2 {
+                        // A swap has occured
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        for (time_after_start, &position) in trajectory.positions.iter().enumerate() {
+            let time = time_after_start + trajectory.start_time;
+            while time >= self.occupied.len() {
+                self.extend_by_one_timestep();
+            }
+            let (x, y) = position;
+            self.occupied[time][trajectory.graph_id][x][y].push(agent_id);
+            let nodes = self
+                .collision_checker
+                .get_blocked_nodes(trajectory.graph_id, x, y);
+            for (graph_id, x, y) in nodes {
+                self.occupied[time][graph_id][x][y].push(agent_id);
+            }
+        }
+        Ok(true)
+    }
+
+    fn extend_by_one_timestep(&mut self) {
+        let graphs: Vec<_> = self
+            .grid_bounds
+            .iter()
+            .map(|&(width, height)| vec![vec![vec![]; width]; height])
+            .collect();
+
+        self.occupied.push(graphs);
+        self.agent_to_cells.push(vec![vec![]; self.max_agents]);
+    }
+
+    fn perform_space_time_search(&mut self, goal: &(usize, usize), depth: usize)
+    {
+
+    }
+
+    fn perform_space_time_search_clears(
+        &mut self, goal: &(usize, usize), dont_occupy: Vec<(usize, usize, usize)>)
+    {
+
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_reservation_system_registration() {
+    let collision_checker = MultiGridCollisionChecker {
+        grid_sizes: vec![1.0, 2.0],
+    };
+    let grid_bounds = vec![(4, 4), (2, 2)];
+    let mut res_sys = HeterogenousReservationSystem {
+        collision_checker,
+        grid_bounds,
+        occupied: vec![],
+        agent_to_cells: vec![],
+        max_agents: 5
+    };
+
+    let trajectory1 = HeterogenousTrajectory {
+        graph_id: 0,
+        start_time: 0,
+        positions: vec![(1, 1), (1, 0), (0, 0)],
+    };
+
+    let res = res_sys.reserve_trajectory(&trajectory1, 0);
+    assert_eq!(res, Ok(true));
+
+    // Can't reserve the same trajectory twise
+    let res = res_sys.reserve_trajectory(&trajectory1, 1);
+    assert_eq!(res, Ok(false));
+
+    // Try swapping in the same graph
+    let trajectory_swap = HeterogenousTrajectory {
+        graph_id: 0,
+        start_time: 1,
+        positions: vec![(0, 0), (1, 0)],
+    };
+    let res = res_sys.reserve_trajectory(&trajectory_swap, 1);
+    assert_eq!(res, Ok(false));
+
+    // Try overlapping trajectory on same graph
+    let trajectory2 = HeterogenousTrajectory {
+        graph_id: 0,
+        start_time: 0,
+        positions: vec![(1, 0), (0, 0), (0, 1)],
+    };
+    let res = res_sys.reserve_trajectory(&trajectory2, 1);
+    assert_eq!(res, Ok(true));
+}
+
 #[cfg(test)]
 #[test]
 fn test_grid_space() {
-    let mut shared_grid_space = MultiGridCollisionChecker {
+    let shared_grid_space = MultiGridCollisionChecker {
         grid_sizes: vec![1.0, 2.0],
     };
     let other_blocked_nodes = shared_grid_space.get_blocked_nodes(0, 1, 1);
