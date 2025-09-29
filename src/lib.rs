@@ -330,7 +330,15 @@ struct TrajectoryRecord {
     start_time: usize,
     end_time: usize,
     agent_id: usize,
+    previous_id: Option<usize>
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct EndTimeInfo {
+    end_time: usize,
+    belongs_to: usize
+}
+
 /// A Spatio-temporal reservation system.
 struct HeterogenousReservationSystem {
     collision_checker: MultiGridCollisionChecker,
@@ -341,7 +349,7 @@ struct HeterogenousReservationSystem {
     trajectory_max_id: usize,
     trajectories: HashMap<usize, TrajectoryRecord>,
     agent_last_location: HashMap<usize, (usize, usize, usize)>,
-    unassigned_agents: Vec<Vec<Vec<HashMap<usize, usize>>>>, // Graph id, x,y, hashmap of agents ->  time
+    unassigned_agents: Vec<Vec<Vec<HashMap<usize, EndTimeInfo>>>>, // Graph id, x,y, hashmap of agents ->  time
 }
 
 impl HeterogenousReservationSystem {
@@ -442,23 +450,27 @@ impl HeterogenousReservationSystem {
             }
         }
 
-        if let Some(&agent_last_loc) = self.agent_last_location.get(&agent_id) {
-            let (graph, x, y) = agent_last_loc;
-            self.unassigned_agents[graph][x][y].remove(&agent_id);
-        }
-        let new_end_time = trajectory.start_time + trajectory.positions.len();
         let Some(&(last_x, last_y)) = trajectory.positions.last() else {
             return Err(ReservationError::TrajectoryEmpty);
         };
+        let mut previous_traj = None;
+        if let Some(&agent_last_loc) = self.agent_last_location.get(&agent_id) {
+            let (graph, x, y) = agent_last_loc;
+            if let Some(end_time_info) = self.unassigned_agents[graph][x][y].remove(&agent_id) {
+                previous_traj = Some(end_time_info.belongs_to);
+            }
+        }
+        let new_end_time = trajectory.start_time + trajectory.positions.len();
         self.agent_last_location
             .insert(agent_id, (trajectory.graph_id, last_x, last_y));
-        self.unassigned_agents[trajectory.graph_id][last_x][last_y].insert(agent_id, new_end_time);
+        self.unassigned_agents[trajectory.graph_id][last_x][last_y].insert(agent_id, EndTimeInfo { end_time: new_end_time, belongs_to: self.trajectory_max_id });
         self.trajectories.insert(
             self.trajectory_max_id,
             TrajectoryRecord {
                 start_time: trajectory.start_time,
                 end_time: new_end_time,
                 agent_id,
+                previous_id: previous_traj
             },
         );
         self.trajectory_max_id += 1;
@@ -505,7 +517,7 @@ fn test_reservation_system_registration() {
     let &agent_last_loc = res_sys.agent_last_location.get(&0usize).unwrap();
     assert_eq!(agent_last_loc, (0,0,0));
     let &end_time = res_sys.unassigned_agents[0][0][0].get(&0usize).unwrap();
-    assert_eq!(end_time, 3);
+    assert_eq!(end_time.end_time, 3);
 
     // Can't reserve the same trajectory twise
     let res = res_sys.reserve_trajectory(&trajectory1, 1);
@@ -548,6 +560,3 @@ fn test_grid_space() {
     assert!(other_blocked_nodes2.contains(&(0, 1, 1)));
     assert!(other_blocked_nodes2.contains(&(0, 0, 0)));
 }
-struct CBSPiBT {}
-
-impl CBSPiBT {}
