@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct PiBT {
     pub grid: Vec<Vec<usize>>,
@@ -321,19 +321,50 @@ enum ReservationError {
     GraphNotFound,
     OutOfGraphBounds(usize, usize, usize),
     TrajectoryForAgentAlreadyExists,
-    ExceedMaxAgents
+    TrajectoryEmpty,
+    ExceedMaxAgents,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TrajectoryRecord {
+    start_time: usize,
+    end_time: usize,
+    agent_id: usize,
+}
 /// A Spatio-temporal reservation system.
 struct HeterogenousReservationSystem {
     collision_checker: MultiGridCollisionChecker,
     grid_bounds: Vec<(usize, usize)>,
     occupied: Vec<Vec<Vec<Vec<Vec<usize>>>>>, // time, graph_id, x, y, agents - Multiple agents can occupy a single cell as we need to take into account agents
     agent_to_cells: Vec<Vec<Vec<(usize, usize, usize)>>>, // For book keeping when we need to rollback. Format is [time][agent_id][cells_affected]
-    max_agents: usize
+    max_agents: usize,
+    trajectory_max_id: usize,
+    trajectories: HashMap<usize, TrajectoryRecord>,
+    agent_last_location: HashMap<usize, (usize, usize, usize)>,
+    unassigned_agents: Vec<Vec<Vec<HashMap<usize, usize>>>>, // Graph id, x,y, hashmap of agents ->  time
 }
 
 impl HeterogenousReservationSystem {
+    /// Create a new Heterogenous reservation system
+    fn new(grid_sizes: Vec<f32>, grid_bounds: Vec<(usize, usize)>, max_agents: usize) -> Self {
+        let collision_checker = MultiGridCollisionChecker { grid_sizes };
+        let unassigned_agents: Vec<_> = grid_bounds
+            .iter()
+            .map(|&(width, height)| vec![vec![HashMap::new(); height]; width])
+            .collect();
+
+        Self {
+            collision_checker,
+            grid_bounds,
+            occupied: vec![],
+            agent_to_cells: vec![],
+            max_agents,
+            trajectory_max_id: 0,
+            trajectories: HashMap::new(),
+            agent_last_location: HashMap::new(),
+            unassigned_agents,
+        }
+    }
     /// Attempts to add a trajectory to the list of trajectories
     /// returns an error if the trajectories are out of the bounds of the managed space-time
     /// returns true if the trajectory if the trajectories are
@@ -341,7 +372,7 @@ impl HeterogenousReservationSystem {
         &mut self,
         trajectory: &HeterogenousTrajectory,
         agent_id: usize,
-    ) -> Result<bool, ReservationError> {
+    ) -> Result<Option<usize>, ReservationError> {
         if agent_id >= self.max_agents {
             return Err(ReservationError::ExceedMaxAgents);
         }
@@ -352,6 +383,9 @@ impl HeterogenousReservationSystem {
             }
             if self.occupied[time].len() < trajectory.graph_id {
                 return Err(ReservationError::GraphNotFound);
+            }
+            if self.agent_to_cells[time][agent_id].len() != 0 {
+                return Err(ReservationError::TrajectoryForAgentAlreadyExists);
             }
             let (x, y) = position;
             if self.occupied[time][trajectory.graph_id].len() < x {
@@ -371,7 +405,7 @@ impl HeterogenousReservationSystem {
 
             if let Some(_) = self.occupied[time][trajectory.graph_id][x][y].first() {
                 // Spot is occupied
-                return Ok(false);
+                return Ok(None);
             }
 
             // Handle swap
@@ -385,7 +419,7 @@ impl HeterogenousReservationSystem {
                 for &agent_2 in &self.occupied[time - 1][trajectory.graph_id][x][y] {
                     if agent == agent_2 {
                         // A swap has occured
-                        return Ok(false);
+                        return Ok(None);
                     }
                 }
             }
@@ -398,14 +432,37 @@ impl HeterogenousReservationSystem {
             }
             let (x, y) = position;
             self.occupied[time][trajectory.graph_id][x][y].push(agent_id);
+            self.agent_to_cells[time][agent_id].push((trajectory.graph_id, x, y));
             let nodes = self
                 .collision_checker
                 .get_blocked_nodes(trajectory.graph_id, x, y);
             for (graph_id, x, y) in nodes {
                 self.occupied[time][graph_id][x][y].push(agent_id);
+                self.agent_to_cells[time][agent_id].push((graph_id, x, y));
             }
         }
-        Ok(true)
+
+        if let Some(&agent_last_loc) = self.agent_last_location.get(&agent_id) {
+            let (graph, x, y) = agent_last_loc;
+            self.unassigned_agents[graph][x][y].remove(&agent_id);
+        }
+        let new_end_time = trajectory.start_time + trajectory.positions.len();
+        let Some(&(last_x, last_y)) = trajectory.positions.last() else {
+            return Err(ReservationError::TrajectoryEmpty);
+        };
+        self.agent_last_location
+            .insert(agent_id, (trajectory.graph_id, last_x, last_y));
+        self.unassigned_agents[trajectory.graph_id][last_x][last_y].insert(agent_id, new_end_time);
+        self.trajectories.insert(
+            self.trajectory_max_id,
+            TrajectoryRecord {
+                start_time: trajectory.start_time,
+                end_time: new_end_time,
+                agent_id,
+            },
+        );
+        self.trajectory_max_id += 1;
+        Ok(Some(self.trajectory_max_id - 1))
     }
 
     fn extend_by_one_timestep(&mut self) {
@@ -419,32 +476,21 @@ impl HeterogenousReservationSystem {
         self.agent_to_cells.push(vec![vec![]; self.max_agents]);
     }
 
-    fn perform_space_time_search(&mut self, goal: &(usize, usize), depth: usize)
-    {
-
-    }
+    fn perform_space_time_search(&mut self, goal: &(usize, usize), depth: usize) {}
 
     fn perform_space_time_search_clears(
-        &mut self, goal: &(usize, usize), dont_occupy: Vec<(usize, usize, usize)>)
-    {
-
+        &mut self,
+        goal: &(usize, usize),
+        dont_occupy: Vec<(usize, usize, usize)>,
+    ) {
     }
 }
 
 #[cfg(test)]
 #[test]
 fn test_reservation_system_registration() {
-    let collision_checker = MultiGridCollisionChecker {
-        grid_sizes: vec![1.0, 2.0],
-    };
     let grid_bounds = vec![(4, 4), (2, 2)];
-    let mut res_sys = HeterogenousReservationSystem {
-        collision_checker,
-        grid_bounds,
-        occupied: vec![],
-        agent_to_cells: vec![],
-        max_agents: 5
-    };
+    let mut res_sys = HeterogenousReservationSystem::new(vec![1.0, 2.0], grid_bounds, 5);
 
     let trajectory1 = HeterogenousTrajectory {
         graph_id: 0,
@@ -453,11 +499,17 @@ fn test_reservation_system_registration() {
     };
 
     let res = res_sys.reserve_trajectory(&trajectory1, 0);
-    assert_eq!(res, Ok(true));
+    assert_eq!(res, Ok(Some(0)));
+
+    // Check the ends are correctly set.
+    let &agent_last_loc = res_sys.agent_last_location.get(&0usize).unwrap();
+    assert_eq!(agent_last_loc, (0,0,0));
+    let &end_time = res_sys.unassigned_agents[0][0][0].get(&0usize).unwrap();
+    assert_eq!(end_time, 3);
 
     // Can't reserve the same trajectory twise
     let res = res_sys.reserve_trajectory(&trajectory1, 1);
-    assert_eq!(res, Ok(false));
+    assert_eq!(res, Ok(None));
 
     // Try swapping in the same graph
     let trajectory_swap = HeterogenousTrajectory {
@@ -466,7 +518,7 @@ fn test_reservation_system_registration() {
         positions: vec![(0, 0), (1, 0)],
     };
     let res = res_sys.reserve_trajectory(&trajectory_swap, 1);
-    assert_eq!(res, Ok(false));
+    assert_eq!(res, Ok(None));
 
     // Try overlapping trajectory on same graph
     let trajectory2 = HeterogenousTrajectory {
@@ -475,7 +527,7 @@ fn test_reservation_system_registration() {
         positions: vec![(1, 0), (0, 0), (0, 1)],
     };
     let res = res_sys.reserve_trajectory(&trajectory2, 1);
-    assert_eq!(res, Ok(true));
+    assert_eq!(res, Ok(Some(1)));
 }
 
 #[cfg(test)]
@@ -487,8 +539,6 @@ fn test_grid_space() {
     let other_blocked_nodes = shared_grid_space.get_blocked_nodes(0, 1, 1);
     let other_blocked_nodes2 = shared_grid_space.get_blocked_nodes(1, 0, 0);
 
-    println!("{:?}", other_blocked_nodes);
-    println!("{:?}", other_blocked_nodes2);
     assert!(other_blocked_nodes.len() == 1);
     assert!(other_blocked_nodes.contains(&(1, 0, 0)));
 
