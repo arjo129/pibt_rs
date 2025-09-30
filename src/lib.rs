@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Vanilla priority based inheritance
+///
+/// This contains a basic PiBT implementation in rust.
 pub struct PiBT {
     pub grid: Vec<Vec<usize>>,
     q: Vec<Vec<(i64, i64)>>,
@@ -330,20 +333,20 @@ struct TrajectoryRecord {
     start_time: usize,
     end_time: usize,
     agent_id: usize,
-    previous_id: Option<usize>
+    previous_id: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct EndTimeInfo {
     end_time: usize,
-    belongs_to: usize
+    belongs_to: usize,
 }
 
 /// A Spatio-temporal reservation system.
 struct HeterogenousReservationSystem {
     collision_checker: MultiGridCollisionChecker,
     grid_bounds: Vec<(usize, usize)>,
-    occupied: Vec<Vec<Vec<Vec<Vec<usize>>>>>, // time, graph_id, x, y, agents - Multiple agents can occupy a single cell as we need to take into account agents
+    occupied: Vec<Vec<Vec<Vec<HashSet<usize>>>>>, // time, graph_id, x, y, agents - Multiple agents can occupy a single cell as we need to take into account agents from different graphs
     agent_to_cells: Vec<Vec<Vec<(usize, usize, usize)>>>, // For book keeping when we need to rollback. Format is [time][agent_id][cells_affected]
     max_agents: usize,
     trajectory_max_id: usize,
@@ -374,8 +377,8 @@ impl HeterogenousReservationSystem {
         }
     }
     /// Attempts to add a trajectory to the list of trajectories
-    /// returns an error if the trajectories are out of the bounds of the managed space-time
-    /// returns true if the trajectory if the trajectories are
+    /// returns the trjactory id of the trajectory if we can add the trajectory to the current set of trajectories
+    /// otherwise it returns an error with the reason for which we cannot
     fn reserve_trajectory(
         &mut self,
         trajectory: &HeterogenousTrajectory,
@@ -411,7 +414,7 @@ impl HeterogenousReservationSystem {
                 ));
             }
 
-            if let Some(_) = self.occupied[time][trajectory.graph_id][x][y].first() {
+            if self.occupied[time][trajectory.graph_id][x][y].len() != 0 {
                 // Spot is occupied
                 return Ok(None);
             }
@@ -439,13 +442,13 @@ impl HeterogenousReservationSystem {
                 self.extend_by_one_timestep();
             }
             let (x, y) = position;
-            self.occupied[time][trajectory.graph_id][x][y].push(agent_id);
+            self.occupied[time][trajectory.graph_id][x][y].insert(agent_id);
             self.agent_to_cells[time][agent_id].push((trajectory.graph_id, x, y));
             let nodes = self
                 .collision_checker
                 .get_blocked_nodes(trajectory.graph_id, x, y);
             for (graph_id, x, y) in nodes {
-                self.occupied[time][graph_id][x][y].push(agent_id);
+                self.occupied[time][graph_id][x][y].insert(agent_id);
                 self.agent_to_cells[time][agent_id].push((graph_id, x, y));
             }
         }
@@ -463,25 +466,76 @@ impl HeterogenousReservationSystem {
         let new_end_time = trajectory.start_time + trajectory.positions.len();
         self.agent_last_location
             .insert(agent_id, (trajectory.graph_id, last_x, last_y));
-        self.unassigned_agents[trajectory.graph_id][last_x][last_y].insert(agent_id, EndTimeInfo { end_time: new_end_time, belongs_to: self.trajectory_max_id });
+        self.unassigned_agents[trajectory.graph_id][last_x][last_y].insert(
+            agent_id,
+            EndTimeInfo {
+                end_time: new_end_time,
+                belongs_to: self.trajectory_max_id,
+            },
+        );
         self.trajectories.insert(
             self.trajectory_max_id,
             TrajectoryRecord {
                 start_time: trajectory.start_time,
                 end_time: new_end_time,
                 agent_id,
-                previous_id: previous_traj
+                previous_id: previous_traj,
             },
         );
         self.trajectory_max_id += 1;
         Ok(Some(self.trajectory_max_id - 1))
     }
 
+    // Internal method to remove trajectory
+    // Note that behaves like a pop. You MUST remove trajectories in the reverse order from the order in which
+    // they have been added
+    fn remove_trajectory(&mut self, trajectory_id: usize) -> Result<(), ()> {
+        let Some(trajectory_information) = self.trajectories.remove(&trajectory_id) else {
+            return Err(());
+        };
+        let Some(agent_location) = self
+            .agent_last_location
+            .remove(&trajectory_information.agent_id)
+        else {
+            return Err(());
+        };
+        let (graph, x, y) = agent_location;
+        // Remove agent from affected cells
+        for time in trajectory_information.start_time..trajectory_information.end_time {
+            for &cell in &self.agent_to_cells[time][trajectory_information.agent_id] {
+                self.occupied[time][cell.0][cell.1][cell.2]
+                    .remove(&trajectory_information.agent_id);
+            }
+            self.agent_to_cells[time][trajectory_information.agent_id].clear();
+        }
+
+        let Some(_) = self.unassigned_agents[graph][x][y].remove(&trajectory_information.agent_id)
+        else {
+            return Err(());
+        };
+
+        let Some(restore_record) = trajectory_information.previous_id else {
+            return Ok(());
+        };
+
+        let Some(previous_traj) = self.trajectories.get(&restore_record) else {
+            return Err(());
+        };
+        self.unassigned_agents[graph][x][y].insert(
+            trajectory_information.agent_id,
+            EndTimeInfo {
+                end_time: previous_traj.end_time,
+                belongs_to: restore_record,
+            },
+        );
+        Ok(())
+    }
+
     fn extend_by_one_timestep(&mut self) {
         let graphs: Vec<_> = self
             .grid_bounds
             .iter()
-            .map(|&(width, height)| vec![vec![vec![]; width]; height])
+            .map(|&(width, height)| vec![vec![HashSet::new(); width]; height])
             .collect();
 
         self.occupied.push(graphs);
@@ -515,7 +569,7 @@ fn test_reservation_system_registration() {
 
     // Check the ends are correctly set.
     let &agent_last_loc = res_sys.agent_last_location.get(&0usize).unwrap();
-    assert_eq!(agent_last_loc, (0,0,0));
+    assert_eq!(agent_last_loc, (0, 0, 0));
     let &end_time = res_sys.unassigned_agents[0][0][0].get(&0usize).unwrap();
     assert_eq!(end_time.end_time, 3);
 
@@ -540,6 +594,60 @@ fn test_reservation_system_registration() {
     };
     let res = res_sys.reserve_trajectory(&trajectory2, 1);
     assert_eq!(res, Ok(Some(1)));
+}
+
+#[cfg(test)]
+#[test]
+fn test_pop_trajectories() {
+    let trajectory1 = HeterogenousTrajectory {
+        graph_id: 0,
+        start_time: 0,
+        positions: vec![(1, 1), (1, 0), (0, 0)],
+    };
+    let trajectory2 = HeterogenousTrajectory {
+        graph_id: 0,
+        start_time: 3,
+        positions: vec![(1, 1), (1, 0), (0, 0)],
+    };
+
+    let grid_bounds = vec![(4, 4), (2, 2)];
+    let mut res_sys = HeterogenousReservationSystem::new(vec![1.0, 2.0], grid_bounds, 5);
+    // Reserve first trajectory
+    let res = res_sys.reserve_trajectory(&trajectory1, 0);
+    assert_eq!(res, Ok(Some(0)));
+
+    // Try re-reserving the trajectory again.
+    let res = res_sys.reserve_trajectory(&trajectory1, 0);
+    assert!(res.is_err());
+
+    // Remove the first trajectory
+    let res = res_sys.remove_trajectory(0);
+    assert_eq!(res, Ok(()));
+
+    // it should be safe to re-reserve the trajectory
+    let res = res_sys.reserve_trajectory(&trajectory1, 0);
+    assert_eq!(res, Ok(Some(1)));
+
+    // Now lets add the second trajectory
+    let res = res_sys.reserve_trajectory(&trajectory2, 0);
+    assert_eq!(res, Ok(Some(2)));
+
+    // We shouldn't be able to re-add that trajectory
+    let res = res_sys.reserve_trajectory(&trajectory2, 0);
+    assert!(res.is_err());
+
+    // We should be able to remove it
+    let res = res_sys.remove_trajectory(2);
+    assert_eq!(res, Ok(()));
+
+    // We shouldn't be able to re-add the first trajectory
+    let res = res_sys.reserve_trajectory(&trajectory1, 0);
+    assert!(res.is_err());
+
+    // We should be able to re-add the removed trajectory
+    let res = res_sys.reserve_trajectory(&trajectory2, 0);
+    assert_eq!(res, Ok(Some(3)));
+
 }
 
 #[cfg(test)]
