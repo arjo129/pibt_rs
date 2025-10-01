@@ -538,61 +538,6 @@ impl HeterogenousReservationSystem {
         self.occupied.push(graphs);
         self.agent_to_cells.push(vec![vec![]; self.max_agents]);
     }
-
-    // Performs a best-first search for next best
-    /*fn perform_space_time_search_clears(
-        &mut self,
-        curr_loc: &(usize, usize, usize),
-        start_time: usize,
-        dont_occupy: HashSet<(usize, usize, usize)>,
-        distance_grid: &Vec<Vec<Vec<i64>>>,
-        max_lookahead: usize,
-    ) {
-        //let mut explored = HashSet::new();
-        let mut pq: BinaryHeap<(usize, usize, (usize, usize, usize))> = BinaryHeap::new();
-        let mut came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)> =
-            HashMap::new();
-        pq.push((0, start_time, *curr_loc));
-        while let Some(p) = pq.pop() {
-            let (score, curr_time, (graph, x, y)) = p;
-            if curr_time + 1 > start_time + max_lookahead {
-                continue;
-            }
-            if !dont_occupy.contains(&(graph, x, y)) {
-                return;
-            }
-
-            let neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)]
-                .iter()
-                .map(|(dx, dy)| (x as i64 + dx, y as i64 + dy))
-                .filter(|&(x, y)| {
-                    x > 0
-                        && y > 0
-                        && x < (distance_grid[graph].len() as i64)
-                        && y < (distance_grid[graph][0].len() as i64)
-                })
-                .map(|(x, y)| (x as usize, y as usize))
-                .filter(|&(x, y)| distance_grid[graph][x][y] >= 0) // Static obstacles
-                .filter(|&(x, y)| self.occupied[curr_time + 1][graph][x][y].len() == 0) // Dynamic obstacles
-                .filter(|&(x, y)| {
-                    for agent in &self.occupied[curr_time][graph][x][y] {
-                        if self.occupied[curr_time + 1][graph][p.2.1][p.2.2].contains(agent) {
-                            return false;
-                        }
-                    }
-                    true
-                });
-
-            for (x, y) in neighbors {
-                let tentative_g_score = curr_time + distance_grid[graph][x][y] as usize;
-                pq.push((tentative_g_score, curr_time + 1, (graph, x, y)));
-                came_from.insert(
-                    (curr_time + 1, graph, x, y),
-                    (curr_time, graph, p.2.1, p.2.2),
-                );
-            }
-        }
-    }*/
 }
 
 struct ProposedPath {
@@ -608,6 +553,7 @@ struct BestFirstSearchInstance<'a, 'b> {
     res_sys: &'a HeterogenousReservationSystem,
     pq: BinaryHeap<(usize, usize, (usize, usize, usize))>,
     came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
+    agent: usize
 }
 
 impl<'a, 'b> BestFirstSearchInstance<'a, 'b> {
@@ -618,6 +564,7 @@ impl<'a, 'b> BestFirstSearchInstance<'a, 'b> {
         dont_occupy: HashSet<(usize, usize, usize)>,
         start_time: usize,
         max_lookahead: usize,
+        agent: usize
     ) -> Self {
         let mut pq = BinaryHeap::new();
         pq.push((0, start_time, curr_loc.clone()));
@@ -630,6 +577,7 @@ impl<'a, 'b> BestFirstSearchInstance<'a, 'b> {
             res_sys,
             pq,
             came_from: HashMap::new(),
+            agent
         }
     }
 }
@@ -687,11 +635,11 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
                 .filter(|&(x, y)| {
                     x > 0
                         && y > 0
-                        && x < (self.distance_grid[graph].len() as i64)
-                        && y < (self.distance_grid[graph][0].len() as i64)
+                        && x < (self.distance_grid[self.agent].len() as i64)
+                        && y < (self.distance_grid[self.agent][0].len() as i64)
                 })
                 .map(|(x, y)| (x as usize, y as usize))
-                .filter(|&(x, y)| self.distance_grid[graph][x][y] >= 0) // Static obstacles
+                .filter(|&(x, y)| self.distance_grid[self.agent][x][y] >= 0) // Static obstacles
                 .filter(|&(x, y)| self.res_sys.occupied[curr_time + 1][graph][x][y].len() == 0) // Dynamic obstacles
                 .filter(|&(x, y)| {
                     for agent in &self.res_sys.occupied[curr_time][graph][x][y] {
@@ -704,7 +652,7 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
                 });
 
             for (x, y) in neighbors {
-                let tentative_g_score = curr_time + self.distance_grid[graph][x][y] as usize;
+                let tentative_g_score = curr_time + self.distance_grid[self.agent][x][y] as usize;
                 if self.came_from.contains_key(&(curr_time + 1, graph, x, y)) {
                     continue;
                 }
@@ -719,6 +667,58 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
         return None;
     }
 }
+
+struct Agent {
+    graph_id: usize,
+    start: (usize, usize),
+    end: (usize,usize)
+}
+
+fn evaluate_heterogenous_agent_grids(base_obstacles: &Vec<Vec<bool>>,
+    graph_scale: Vec<f32>, agents: Vec<Agent>) -> Vec<Vec<Vec<i64>>>
+{
+    let mut distance_grids = vec![];
+    for agent in agents {
+        let grid = evaluate_individual_agent_cost(base_obstacles, &agent, &graph_scale);
+        distance_grids.push(grid);
+    }
+    distance_grids
+}
+
+fn evaluate_individual_agent_cost(base_obstacles: &Vec<Vec<bool>>, agent: &Agent, graph_scale: &Vec<f32>) -> Vec<Vec<i64>>
+{
+    let width = (((base_obstacles[0].len() as f32)/ graph_scale[agent.graph_id]) as usize);
+    let height = (((base_obstacles.len() as f32)/ graph_scale[agent.graph_id]) as usize);
+    let mut distance_grid = vec![vec![-5;  width];  height];
+
+    for x in 0..base_obstacles.len() {
+        for y in 0..base_obstacles[0].len() {
+            if base_obstacles[x][y] {
+                let x = x as f32;
+                let y = y as f32;
+                let x_idx = (x / graph_scale[agent.graph_id]) as usize;
+                let y_idx = (y / graph_scale[agent.graph_id]) as usize;
+                distance_grid[x_idx][y_idx] = -1;
+            }
+        }
+    }
+
+    let mut queue = VecDeque::new();
+    queue.push_back((agent.end, 0));
+    while let Some((node, score)) = queue.pop_front() {
+        distance_grid[node.0][node.1]= score;
+        let neighbours = [(-1,0),(0,-1), (1,0),(0,1)].iter().map(|(dx,dy)| (node.0 as i64 +dx, node.1 as i64+dy))
+        .filter(|&(x,y)| x >= 0 && y >= 0 && x < width as i64 && y < height as i64)
+        .map(|(x,y)| (x as usize, y as usize))
+        .filter(|&(x,y)| distance_grid[x][y] == -5);
+        for n in neighbours {
+            queue.push_back((n, score+1));
+        }
+    }
+
+    distance_grid
+}
+
 
 #[cfg(test)]
 #[test]
