@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::{cmp::Reverse, collections::{BinaryHeap, HashMap, HashSet, VecDeque}};
 
 /// Vanilla priority based inheritance
 ///
@@ -255,8 +255,8 @@ pub fn parse_scen(file_name: &str) -> Result<Vec<Vec<(usize, usize)>>, std::num:
 /// When converting between coordinate space, the grid clip mode
 /// is in charge of figuring out how to handle rounding.
 enum GridClipMode {
-    CONSERVATIVE_TOP_LEFT,
-    CONSERVATIVE_BOTTOM_RIGHT,
+    ConservativeTopLeft,
+    ConservativeBottomRight,
 }
 
 /// Internal collision checking structure for mapping between grid cells
@@ -282,10 +282,10 @@ impl MultiGridCollisionChecker {
             let (tl_x, tl_y) = (real_world_x, real_world_y);
             let (br_x, br_y) = (real_world_x + target_size, real_world_y + target_size);
             let (start_x, start_y) =
-                self.get_grid_space(id, tl_x, tl_y, GridClipMode::CONSERVATIVE_TOP_LEFT);
+                self.get_grid_space(id, tl_x, tl_y, GridClipMode::ConservativeTopLeft);
 
             let (end_x, end_y) =
-                self.get_grid_space(id, br_x, br_y, GridClipMode::CONSERVATIVE_BOTTOM_RIGHT);
+                self.get_grid_space(id, br_x, br_y, GridClipMode::ConservativeBottomRight);
 
             for dx in start_x..end_x {
                 for dy in start_y..end_y {
@@ -303,17 +303,17 @@ impl MultiGridCollisionChecker {
         );
 
         match (mode) {
-            GridClipMode::CONSERVATIVE_TOP_LEFT => {
+            GridClipMode::ConservativeTopLeft => {
                 (coords.0.floor() as usize, coords.1.floor() as usize)
             }
-            GridClipMode::CONSERVATIVE_BOTTOM_RIGHT => {
+            GridClipMode::ConservativeBottomRight => {
                 (coords.0.ceil() as usize, coords.1.ceil() as usize)
             }
         }
     }
 }
 
-struct HeterogenousTrajectory {
+pub struct HeterogenousTrajectory {
     graph_id: usize,
     start_time: usize,
     positions: Vec<(usize, usize)>,
@@ -351,7 +351,7 @@ struct HeterogenousReservationSystem {
     max_agents: usize,
     trajectory_max_id: usize,
     trajectories: HashMap<usize, TrajectoryRecord>,
-    agent_last_location: HashMap<usize, (usize, usize, usize)>,
+    agent_last_location: HashMap<usize, (usize, usize, usize)>, // agent->(graph_id,x ,y)
     unassigned_agents: Vec<Vec<Vec<HashMap<usize, EndTimeInfo>>>>, // Graph id, x,y, hashmap of agents ->  time
 }
 
@@ -540,6 +540,7 @@ impl HeterogenousReservationSystem {
     }
 }
 
+#[derive(Debug)]
 struct ProposedPath {
     path: Vec<(usize, usize, usize)>,
     need_to_moveout: Vec<usize>,
@@ -551,7 +552,7 @@ struct BestFirstSearchInstance<'a, 'b> {
     distance_grid: &'b Vec<Vec<Vec<i64>>>,
     max_lookahead: usize,
     res_sys: &'a HeterogenousReservationSystem,
-    pq: BinaryHeap<(usize, usize, (usize, usize, usize))>,
+    pq: BinaryHeap<Reverse<(usize, usize, (usize, usize, usize))>>,
     came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
     agent: usize
 }
@@ -567,7 +568,7 @@ impl<'a, 'b> BestFirstSearchInstance<'a, 'b> {
         agent: usize
     ) -> Self {
         let mut pq = BinaryHeap::new();
-        pq.push((0, start_time, curr_loc.clone()));
+        pq.push(Reverse((0, start_time, curr_loc.clone())));
         BestFirstSearchInstance {
             curr_loc,
             start_time,
@@ -586,11 +587,11 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
     type Item = ProposedPath;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(p) = self.pq.pop() {
-            let (score, curr_time, (graph, x, y)) = p;
-            if !self.dont_occupy.contains(&(graph, x, y)) {
+        while let Some(Reverse(p)) = self.pq.pop() {
+            let (score, curr_time, (parent_graph, parent_x, parent_y)) = p;
+            if !self.dont_occupy.contains(&(parent_graph, parent_x, parent_y)) {
                 // Backtrack
-                let mut node = (curr_time, graph, x, y);
+                let mut node = (curr_time, parent_graph, parent_x, parent_y);
                 let mut v = vec![node.clone()];
                 while let Some(p) = self.came_from.get(&node) {
                     v.push(p.clone());
@@ -600,8 +601,9 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
 
                 let mut agents_to_kickout = HashSet::new();
                 for &(time, graph, x, y) in v.iter() {
+                    let time = self.start_time + time;
                     for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
-                        if end_time_info.end_time < time {
+                        if end_time_info.end_time <= time && *agent != self.agent {
                             agents_to_kickout.insert(*agent);
                         }
                     }
@@ -612,7 +614,7 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
                         .get_blocked_nodes(graph, x, y);
                     for &(graph, x, y) in &other_nodes {
                         for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
-                            if end_time_info.end_time < time {
+                            if end_time_info.end_time <= time {
                                 agents_to_kickout.insert(*agent);
                             }
                         }
@@ -626,24 +628,27 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
             }
 
             if curr_time + 1 > self.start_time + self.max_lookahead {
+                println!("Exceeded lookahead");
                 continue;
             }
 
             let neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)]
                 .iter()
-                .map(|(dx, dy)| (x as i64 + dx, y as i64 + dy))
+                .map(|(dx, dy)| (parent_x as i64 + dx, parent_y as i64 + dy))
                 .filter(|&(x, y)| {
-                    x > 0
-                        && y > 0
+                    x >= 0
+                        && y >= 0
                         && x < (self.distance_grid[self.agent].len() as i64)
                         && y < (self.distance_grid[self.agent][0].len() as i64)
                 })
                 .map(|(x, y)| (x as usize, y as usize))
                 .filter(|&(x, y)| self.distance_grid[self.agent][x][y] >= 0) // Static obstacles
-                .filter(|&(x, y)| self.res_sys.occupied[curr_time + 1][graph][x][y].len() == 0) // Dynamic obstacles
                 .filter(|&(x, y)| {
-                    for agent in &self.res_sys.occupied[curr_time][graph][x][y] {
-                        if self.res_sys.occupied[curr_time + 1][graph][p.2.1][p.2.2].contains(agent)
+                    self.res_sys.occupied.len() >= (curr_time + 1) ||
+                    self.res_sys.occupied[curr_time + 1][parent_graph][x][y].len() == 0}) // Dynamic obstacles
+                .filter(|&(x, y)| {
+                    for agent in &self.res_sys.occupied[curr_time][parent_graph][x][y] {
+                        if self.res_sys.occupied[curr_time + 1][parent_graph][p.2.1][p.2.2].contains(agent)
                         {
                             return false;
                         }
@@ -653,14 +658,14 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
 
             for (x, y) in neighbors {
                 let tentative_g_score = curr_time + self.distance_grid[self.agent][x][y] as usize;
-                if self.came_from.contains_key(&(curr_time + 1, graph, x, y)) {
+                if self.came_from.contains_key(&(curr_time + 1, parent_graph, x, y)) {
                     continue;
                 }
                 self.pq
-                    .push((tentative_g_score, curr_time + 1, (graph, x, y)));
+                    .push(Reverse((tentative_g_score, curr_time + 1, (parent_graph, x, y))));
                 self.came_from.insert(
-                    (curr_time + 1, graph, x, y),
-                    (curr_time, graph, p.2.1, p.2.2),
+                    (curr_time + 1, parent_graph, x, y),
+                    (curr_time, parent_graph, p.2.1, p.2.2),
                 );
             }
         }
@@ -668,14 +673,20 @@ impl<'a, 'b> Iterator for BestFirstSearchInstance<'a, 'b> {
     }
 }
 
-struct Agent {
-    graph_id: usize,
-    start: (usize, usize),
-    end: (usize,usize)
+/// Heterogenous Agent configuration
+pub struct HeterogenousAgent {
+    pub graph_id: usize,
+    pub start: (usize, usize),
+    pub end: (usize,usize)
 }
 
-fn evaluate_heterogenous_agent_grids(base_obstacles: &Vec<Vec<bool>>,
-    graph_scale: Vec<f32>, agents: Vec<Agent>) -> Vec<Vec<Vec<i64>>>
+
+/// Runs breadth first search to evaluate the distance for each agent to its goal
+/// base_obstacles - The obstacle grid base that is true if there is an obstacle false if there isnt
+/// graph_scale - The size of each planning cell for each agent
+/// agents - Each agent's start and goal
+pub fn evaluate_heterogenous_agent_grids(base_obstacles: &Vec<Vec<bool>>,
+    graph_scale: &Vec<f32>, agents: &Vec<HeterogenousAgent>) -> Vec<Vec<Vec<i64>>>
 {
     let mut distance_grids = vec![];
     for agent in agents {
@@ -685,10 +696,13 @@ fn evaluate_heterogenous_agent_grids(base_obstacles: &Vec<Vec<bool>>,
     distance_grids
 }
 
-fn evaluate_individual_agent_cost(base_obstacles: &Vec<Vec<bool>>, agent: &Agent, graph_scale: &Vec<f32>) -> Vec<Vec<i64>>
+/// Runs BFS for an individual agent and returns the cost for each location.
+fn evaluate_individual_agent_cost(base_obstacles: &Vec<Vec<bool>>, agent: &HeterogenousAgent, graph_scale: &Vec<f32>) -> Vec<Vec<i64>>
 {
     let width = (((base_obstacles[0].len() as f32)/ graph_scale[agent.graph_id]) as usize);
     let height = (((base_obstacles.len() as f32)/ graph_scale[agent.graph_id]) as usize);
+
+    println!("Dimensions: {} x {}", width, height);
     let mut distance_grid = vec![vec![-5;  width];  height];
 
     for x in 0..base_obstacles.len() {
@@ -719,6 +733,85 @@ fn evaluate_individual_agent_cost(base_obstacles: &Vec<Vec<bool>>, agent: &Agent
     distance_grid
 }
 
+/// Heterogenous PiBT
+pub struct HetPiBT {
+    cost_map: Vec<Vec<Vec<i64>>>,
+    reservation_system: HeterogenousReservationSystem
+}
+
+impl HetPiBT {
+    pub fn init_solver(base_obstacles: &Vec<Vec<bool>>,
+    graph_scale: Vec<f32>, grid_bounds: Vec<(usize, usize)>, agents: Vec<HeterogenousAgent>) -> Self {
+        let cost_map = evaluate_heterogenous_agent_grids(base_obstacles, &graph_scale, &agents);
+        let mut reservation_system = HeterogenousReservationSystem::new(graph_scale, grid_bounds, agents.len());
+        for (agent_id, agent) in agents.iter().enumerate() {
+            let start_traj = HeterogenousTrajectory {
+                graph_id: agent.graph_id,
+                start_time: 0,
+                positions: vec![agent.start]
+            };
+            reservation_system.reserve_trajectory(&start_traj, agent_id).unwrap();
+        }
+
+        Self {
+            cost_map,
+            reservation_system
+        }
+    }
+
+    /// Attempt to solve for agent
+    fn attempt_solve_for_agent(&self, agent_id: usize, forward_lookup: usize) {
+        let Some(&(graph, x, y)) = self.reservation_system.agent_last_location.get(&agent_id) else {
+            return;
+        };
+        let Some(end_time) = self.reservation_system.unassigned_agents[graph][x][y].get(&agent_id) else {
+            return;
+        };
+        let time = end_time.end_time-1;
+        println!("{}", time);
+
+        let mut blocked_locations = HashSet::new();
+        blocked_locations.insert((graph,x,y));
+
+        let search = BestFirstSearchInstance::create_search_instance(&self.reservation_system, &self.cost_map, (graph,x,y), blocked_locations, time, forward_lookup, agent_id);
+        for neighbour in search {
+            // TODO(arjo) ProposedPath should return a heterogenous
+            println!("Neighbour {:?}", neighbour);
+            /*let path = neighbour.path;
+            self.reservation_system.reserve_trajectory(, agent_id)
+            for n in neighbour.need_to_moveout {
+
+            }*/
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_solver() {
+    let base_obstacles = vec![
+        vec![false, false, false, false],
+        vec![false, false, false, false],
+        vec![false; 4],
+        vec![false; 4]
+    ];
+    let grid_bounds = vec![(4, 4), (2, 2)];
+    let mut graph_scale = vec![1.0,2.0];
+    let agent1 = HeterogenousAgent {
+        graph_id: 0,
+        start: (0,3),
+        end: (3,3)
+    };
+    let agent2 = HeterogenousAgent {
+        graph_id: 1,
+        start: (0,0),
+        end: (0,1)
+    };
+    let agents = vec![agent1, agent2];
+    let mut het_pibt = HetPiBT::init_solver(&base_obstacles, graph_scale, grid_bounds, agents);
+    het_pibt.reservation_system.extend_by_one_timestep();
+    het_pibt.attempt_solve_for_agent(1,2);
+}
 
 #[cfg(test)]
 #[test]
