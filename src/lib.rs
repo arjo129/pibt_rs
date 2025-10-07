@@ -1,5 +1,5 @@
 use std::{
-    cmp::Reverse,
+    cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
 };
 
@@ -329,6 +329,7 @@ enum ReservationError {
     TrajectoryForAgentAlreadyExists,
     TrajectoryEmpty,
     ExceedMaxAgents,
+    AgentSwappedGraphs,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -345,6 +346,13 @@ struct EndTimeInfo {
     belongs_to: usize,
 }
 
+/// End time and location
+struct EndTimeAndLocation {
+    end_time: usize,
+    x: usize,
+    y: usize,
+}
+
 /// A Spatio-temporal reservation system.
 struct HeterogenousReservationSystem {
     collision_checker: MultiGridCollisionChecker,
@@ -356,6 +364,7 @@ struct HeterogenousReservationSystem {
     trajectories: HashMap<usize, TrajectoryRecord>,
     agent_last_location: HashMap<usize, (usize, usize, usize)>, // agent->(graph_id,x ,y)
     unassigned_agents: Vec<Vec<Vec<HashMap<usize, EndTimeInfo>>>>, // Graph id, x,y, hashmap of agents ->  time
+    agent_to_graph: Vec<Option<usize>>,
 }
 
 impl HeterogenousReservationSystem {
@@ -366,6 +375,7 @@ impl HeterogenousReservationSystem {
             .iter()
             .map(|&(width, height)| vec![vec![HashMap::new(); height]; width])
             .collect();
+        let agent_to_graph = vec![None; max_agents];
 
         Self {
             collision_checker,
@@ -377,6 +387,7 @@ impl HeterogenousReservationSystem {
             trajectories: HashMap::new(),
             agent_last_location: HashMap::new(),
             unassigned_agents,
+            agent_to_graph,
         }
     }
     /// Attempts to add a trajectory to the list of trajectories
@@ -389,6 +400,13 @@ impl HeterogenousReservationSystem {
     ) -> Result<Option<usize>, ReservationError> {
         if agent_id >= self.max_agents {
             return Err(ReservationError::ExceedMaxAgents);
+        }
+        if let Some(agent_graph) = self.agent_to_graph[agent_id] {
+            if trajectory.graph_id != agent_graph {
+                return Err(ReservationError::AgentSwappedGraphs);
+            }
+        } else {
+            self.agent_to_graph[agent_id] = Some(trajectory.graph_id);
         }
         for (time_after_start, &position) in trajectory.positions.iter().enumerate() {
             let time = time_after_start + trajectory.start_time;
@@ -560,6 +578,42 @@ impl HeterogenousReservationSystem {
         self.occupied.push(graphs);
         self.agent_to_cells.push(vec![vec![]; self.max_agents]);
     }
+
+    /// For visuallization
+    fn get_agents_at_timestep(&self, time_step: usize) -> Vec<Option<(usize, usize, usize)>> {
+        let agents = 0..self.max_agents;
+        agents
+            .map(|p| {
+                let Some(graph_id) = self.agent_to_graph[p] else {
+                    return None;
+                };
+                let Some(&(_, x, y)) = self.agent_to_cells[time_step][p]
+                    .iter()
+                    .filter(|&(graph, _x, _y)| *graph == graph_id)
+                    .next()
+                else {
+                    return None;
+                };
+                Some((graph_id, x, y))
+            })
+            .collect()
+    }
+
+    /// To retrieve the last time and distance to goal.
+    fn get_agent_last_alloc_time(&self, agent: usize) -> Result<EndTimeAndLocation, ()> {
+        let Some(&(graph, x, y)) = self.agent_last_location.get(&agent) else {
+            return Err(());
+        };
+        let Some(agent) = self.unassigned_agents[graph][x][y].get(&agent) else {
+            return Err(());
+        };
+
+        Ok(EndTimeAndLocation {
+            end_time: agent.end_time,
+            x,
+            y,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -653,7 +707,6 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
             }
 
             if curr_time + 1 > self.start_time + self.max_lookahead {
-                println!("Exceeded lookahead");
                 continue;
             }
 
@@ -756,23 +809,32 @@ fn evaluate_individual_agent_cost(
 
     let mut queue = VecDeque::new();
     queue.push_back((agent.end, 0));
+    let directions = [(-1, 0), (0, -1), (1, 0), (0, 1)];
+    distance_grid[agent.end.0][agent.end.1] = 0;
+
     while let Some((node, score)) = queue.pop_front() {
-        distance_grid[node.0][node.1] = score;
-        let neighbours = [(-1, 0), (0, -1), (1, 0), (0, 1)]
-            .iter()
-            .map(|(dx, dy)| (node.0 as i64 + dx, node.1 as i64 + dy))
-            .filter(|&(x, y)| x >= 0 && y >= 0 && x < width as i64 && y < height as i64)
-            .map(|(x, y)| (x as usize, y as usize))
-            .filter(|&(x, y)| distance_grid[x][y] == -5);
-        for n in neighbours {
-            queue.push_back((n, score + 1));
+        let (x, y) = node;
+        let (x, y) = (x as i64, y as i64);
+        for &(dx, dy) in &directions {
+            let nx = x + dx;
+            let ny = y + dy;
+
+            // Check bounds
+            if nx >= 0 && ny >= 0 && nx < width as i64 && ny < height as i64 {
+                let n_usize = (nx as usize, ny as usize);
+                // Check if unvisited
+                if distance_grid[n_usize.0][n_usize.1] == -5 {
+                    queue.push_back((n_usize, score + 1));
+                    distance_grid[n_usize.0][n_usize.1] = score + 1;
+                }
+            }
         }
     }
 
     distance_grid
 }
 
-/// Heterogenous PiBT
+/// Heterogenous PiBT using the reasoning module
 pub struct HetPiBT {
     cost_map: Vec<Vec<Vec<i64>>>,
     reservation_system: HeterogenousReservationSystem,
@@ -786,6 +848,7 @@ impl HetPiBT {
         agents: Vec<HeterogenousAgent>,
     ) -> Self {
         let cost_map = evaluate_heterogenous_agent_grids(base_obstacles, &graph_scale, &agents);
+        println!("{:?}", cost_map);
         let mut reservation_system =
             HeterogenousReservationSystem::new(graph_scale, grid_bounds, agents.len());
         for (agent_id, agent) in agents.iter().enumerate() {
@@ -821,11 +884,11 @@ impl HetPiBT {
         stack.push((
             agent_id,
             HashSet::from_iter([(graph, x, y)].iter().cloned()),
+            forward_lookup,
         ));
         let mut will_affect = HashMap::new();
-        while let Some((agent_id, blocked_locations)) = stack.pop() {
+        while let Some((agent_id, blocked_locations, forward_lookup)) = stack.pop() {
             // Try to get the robot to move out
-
             let search = BestFirstSearchInstance::create_search_instance(
                 &self.reservation_system,
                 &self.cost_map,
@@ -850,7 +913,19 @@ impl HetPiBT {
                         // Deadlock. Do not proceed
                         continue;
                     }
-                    stack.push((neighbour.need_to_moveout[0], c));
+
+                    let my_size = self.reservation_system.collision_checker.grid_sizes
+                        [self.reservation_system.agent_to_graph[agent_id].unwrap()];
+                    let other_size = self.reservation_system.collision_checker.grid_sizes[self
+                        .reservation_system
+                        .agent_to_graph[neighbour.need_to_moveout[0]]
+                        .unwrap()];
+                    let mut forward_lookup = forward_lookup;
+                    if other_size < my_size {
+                        let factor = (my_size / other_size).round() as usize;
+                        forward_lookup *= factor * factor;
+                    }
+                    stack.push((neighbour.need_to_moveout[0], c, forward_lookup));
                     will_affect.insert(
                         neighbour.need_to_moveout[0],
                         (agent_id, neighbour.path.clone()),
@@ -893,6 +968,62 @@ impl HetPiBT {
                 .unwrap();
             return;
         }
+    }
+
+    pub fn solve(&mut self, max_time_steps: usize) -> Option<usize> {
+        let mut agent_priorities = vec![None; self.reservation_system.max_agents];
+        for step in 0..max_time_steps {
+            let agents = 0..self.reservation_system.max_agents;
+            let mut total_cost = 0;
+            for a in agents {
+                let agent = self
+                    .reservation_system
+                    .get_agent_last_alloc_time(a)
+                    .unwrap();
+
+                if agent.end_time < step {
+                    let cost = self.cost_map[a][agent.x][agent.y];
+                    if cost >= 0 {
+                        agent_priorities[a] = Some((cost, a));
+                        total_cost += cost;
+                    }
+                }
+            }
+            if total_cost == 0 {
+                return Some(step);
+            }
+            agent_priorities.sort_by(|a, b| {
+                let Some(a) = a else {
+                    let Some(b) = b else {
+                        return Ordering::Equal;
+                    };
+                    return Ordering::Greater;
+                };
+
+                let Some(b) = b else {
+                    return Ordering::Less;
+                };
+                a.cmp(b)
+            });
+            for &agent in &agent_priorities {
+                let Some((_cost, agent_id)) = agent else {
+                    continue;
+                };
+                let last_time = self
+                    .reservation_system
+                    .get_agent_last_alloc_time(agent_id)
+                    .unwrap();
+                if last_time.end_time > step {
+                    continue;
+                }
+                self.attempt_solve_for_agent(agent_id, 2);
+            }
+        }
+        None
+    }
+
+    pub fn get_trajectories(&self, time_step: usize) -> Vec<Option<(usize, usize, usize)>> {
+        self.reservation_system.get_agents_at_timestep(time_step)
     }
 }
 
