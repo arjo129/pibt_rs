@@ -316,6 +316,7 @@ impl MultiGridCollisionChecker {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeterogenousTrajectory {
     graph_id: usize,
     start_time: usize,
@@ -347,6 +348,7 @@ struct EndTimeInfo {
 }
 
 /// End time and location
+#[derive(Clone, Copy, Debug)]
 struct EndTimeAndLocation {
     end_time: usize,
     x: usize,
@@ -667,7 +669,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
             let (score, curr_time, (parent_graph, parent_x, parent_y)) = p;
             if !self
                 .dont_occupy
-                .contains(&(parent_graph, parent_x, parent_y))
+                .contains(&(parent_graph, parent_x, parent_y)) || self.distance_grid[self.agent][parent_x][parent_y] == 0
             {
                 // Backtrack
                 let mut node = (curr_time, parent_graph, parent_x, parent_y);
@@ -760,6 +762,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
 }
 
 /// Heterogenous Agent configuration
+#[derive(Debug, Clone)]
 pub struct HeterogenousAgent {
     pub graph_id: usize,
     pub start: (usize, usize),
@@ -848,7 +851,6 @@ impl HetPiBT {
         agents: Vec<HeterogenousAgent>,
     ) -> Self {
         let cost_map = evaluate_heterogenous_agent_grids(base_obstacles, &graph_scale, &agents);
-        println!("{:?}", cost_map);
         let mut reservation_system =
             HeterogenousReservationSystem::new(graph_scale, grid_bounds, agents.len());
         for (agent_id, agent) in agents.iter().enumerate() {
@@ -937,9 +939,11 @@ impl HetPiBT {
                         start_time: end_time.end_time.clone(),
                         positions: neighbour.path.iter().map(|&(_, x, y)| (x, y)).collect(),
                     };
+                    println!("Agent {}", agent);
+                    println!("{:?}", path_to_reserve);
                     self.reservation_system
                         .reserve_trajectory(&path_to_reserve, agent_id)
-                        .unwrap();
+                        .map_err(|p| panic!("{:?}", p));
 
                     // Cascade the delays back up the chain
                     while let Some((agent_id, path)) = will_affect.get(&agent) {
@@ -956,6 +960,7 @@ impl HetPiBT {
                             hypot_path.start_time += 1;
                         }
                     }
+                    return;
                 }
             }
             let path_to_reserve = HeterogenousTrajectory {
@@ -971,25 +976,58 @@ impl HetPiBT {
     }
 
     pub fn solve(&mut self, max_time_steps: usize) -> Option<usize> {
-        let mut agent_priorities = vec![None; self.reservation_system.max_agents];
-        for step in 0..max_time_steps {
+        let mut agent_priorities: Vec<_> = (0..self.reservation_system.max_agents).map(|p|{
+            let Some(&(graph,x,y)) = self.reservation_system.agent_last_location.get(&p) else {
+                panic!("Solver was not properly initiallized");
+            };
+            Some(((self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32,p))
+        }).collect();
+
+        // Hashmap tracks agent priority.
+        let mut last_prio: HashMap<_,_> =
+            agent_priorities.iter().enumerate().filter(|p| p.1.is_some())
+            .map(|(ind, opt)|{
+                let (_,b )= opt.unwrap();
+                (b,ind)}).collect();
+        for step in 1..max_time_steps {
             let agents = 0..self.reservation_system.max_agents;
-            let mut total_cost = 0;
+            let mut flg_fin = true;
+            let mut checked = false;
+            self.reservation_system.extend_by_one_timestep();
             for a in agents {
                 let agent = self
                     .reservation_system
                     .get_agent_last_alloc_time(a)
                     .unwrap();
 
-                if agent.end_time < step {
+                if agent.end_time <= step {
+                    checked = true;
                     let cost = self.cost_map[a][agent.x][agent.y];
-                    if cost >= 0 {
-                        agent_priorities[a] = Some((cost, a));
-                        total_cost += cost;
+                    println!("cost at current step {}", cost);
+                    let Some(&idx) = last_prio.get(&a) else {
+                        panic!("Could not find ");
+                    };
+                    let Some(x) = agent_priorities[idx].as_mut() else {
+                            panic!("Failed to calculate cost");
+                        };
+
+                    // For debugging
+                    assert!(x.1 == a);
+
+                    println!("Priority at current step {:?} for {}",x, a);
+                    if cost == 0 {
+                        x.0 -= x.0.floor();
+                    }
+                    else {
+                        x.0 += 1.0;
+                        flg_fin = false;
                     }
                 }
             }
-            if total_cost == 0 {
+            if !checked {
+                continue;
+            }
+            if flg_fin {
                 return Some(step);
             }
             agent_priorities.sort_by(|a, b| {
@@ -1003,8 +1041,14 @@ impl HetPiBT {
                 let Some(b) = b else {
                     return Ordering::Less;
                 };
-                a.cmp(b)
+                a.partial_cmp(b).unwrap()
             });
+
+            last_prio =
+            agent_priorities.iter().enumerate().filter(|p| p.1.is_some())
+            .map(|(ind, opt)|{
+                let (_,b )= opt.unwrap();
+                (b,ind)}).collect();
             for &agent in &agent_priorities {
                 let Some((_cost, agent_id)) = agent else {
                     continue;
@@ -1016,7 +1060,7 @@ impl HetPiBT {
                 if last_time.end_time > step {
                     continue;
                 }
-                self.attempt_solve_for_agent(agent_id, 2);
+                self.attempt_solve_for_agent(agent_id, 1);
             }
         }
         None
