@@ -3,6 +3,9 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
 };
 
+mod collision_checker;
+mod pibt_with_constraints;
+
 /// Vanilla priority based inheritance
 ///
 /// This contains a basic PiBT implementation in rust.
@@ -313,6 +316,65 @@ impl MultiGridCollisionChecker {
                 (coords.0.ceil() as usize, coords.1.ceil() as usize)
             }
         }
+    }
+
+    fn build_moving_obstacle_map(&self, trajectories: &Vec<Vec<Vec<(i64, i64)>>>, boundaries: Vec<(usize,usize)>) -> Result<(),()> {
+        // agent_map
+        let mut agent_map: Vec<Vec<Vec<Vec<Option<usize>>>>> = vec![];
+        //let mut conflicts = vec![];
+        // Assume all agents are the same.
+        for graph in 0..trajectories.len() {
+            let mut graphs_map = vec![];
+            for t in 0..trajectories[graph].len() {
+                let mut grid = vec![vec![None; boundaries[graph].0]; boundaries[graph].1];
+                for agent in 0..trajectories[graph][t].len() {
+                    let (ax,ay) = trajectories[graph][t][agent];
+                    if ax < 0 ||ay < 0 {
+                        return Err(());
+                    }
+                    grid[ax as usize][ay as usize] = Some(agent);
+                }
+                graphs_map.push(grid);
+            }
+            agent_map.push(graphs_map);
+        }
+
+        // Assume all agents are the same.
+        for graph in 0..trajectories.len() {
+            for t in 0..trajectories[graph].len() {
+                for agent in 0..trajectories[graph][t].len() {
+                    let (ax,ay) = trajectories[graph][t][agent];
+                    let nodes = self.get_blocked_nodes(graph, ax as usize, ay as usize);
+                    for node in nodes {
+                        // Only consider multi-fleet
+                        if node.0 ==graph {
+                            continue;
+                        }
+                        if agent_map[node.0][t][node.1][node.2].is_some() {
+                           // Mark conflict
+
+                        }
+
+                        // Handle swap
+                        if t == 0 {
+                            // We only check for swaps after they occur
+                            continue;
+                        }
+
+                        let (from_x, from_y) = trajectories[graph][t-1][agent];
+                        if let Some(agent ) = agent_map[graph][t][from_x as usize][from_y as usize] {
+                            if Some(agent) == agent_map[node.0][t][node.1][node.2] {
+
+                            }
+                            /*if self.occupied[time - 1][trajectory.graph_id][x][y].contains(agent) {
+                                return Ok(None);
+                            }*/
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -669,7 +731,8 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
             let (score, curr_time, (parent_graph, parent_x, parent_y)) = p;
             if !self
                 .dont_occupy
-                .contains(&(parent_graph, parent_x, parent_y)) || self.distance_grid[self.agent][parent_x][parent_y] == 0
+                .contains(&(parent_graph, parent_x, parent_y))
+                || self.distance_grid[self.agent][parent_x][parent_y] == 0 ||(self.curr_loc == (parent_graph, parent_x, parent_y) && curr_time != self.start_time)
             {
                 // Backtrack
                 let mut node = (curr_time, parent_graph, parent_x, parent_y);
@@ -976,19 +1039,29 @@ impl HetPiBT {
     }
 
     pub fn solve(&mut self, max_time_steps: usize) -> Option<usize> {
-        let mut agent_priorities: Vec<_> = (0..self.reservation_system.max_agents).map(|p|{
-            let Some(&(graph,x,y)) = self.reservation_system.agent_last_location.get(&p) else {
-                panic!("Solver was not properly initiallized");
-            };
-            Some(((self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32,p))
-        }).collect();
+        let mut agent_priorities: Vec<_> = (0..self.reservation_system.max_agents)
+            .map(|p| {
+                let Some(&(graph, x, y)) = self.reservation_system.agent_last_location.get(&p)
+                else {
+                    panic!("Solver was not properly initiallized");
+                };
+                Some((
+                    (self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32,
+                    p,
+                ))
+            })
+            .collect();
 
         // Hashmap tracks agent priority.
-        let mut last_prio: HashMap<_,_> =
-            agent_priorities.iter().enumerate().filter(|p| p.1.is_some())
-            .map(|(ind, opt)|{
-                let (_,b )= opt.unwrap();
-                (b,ind)}).collect();
+        let mut last_prio: HashMap<_, _> = agent_priorities
+            .iter()
+            .enumerate()
+            .filter(|p| p.1.is_some())
+            .map(|(ind, opt)| {
+                let (_, b) = opt.unwrap();
+                (b, ind)
+            })
+            .collect();
         for step in 1..max_time_steps {
             let agents = 0..self.reservation_system.max_agents;
             let mut flg_fin = true;
@@ -1008,17 +1081,16 @@ impl HetPiBT {
                         panic!("Could not find ");
                     };
                     let Some(x) = agent_priorities[idx].as_mut() else {
-                            panic!("Failed to calculate cost");
-                        };
+                        panic!("Failed to calculate cost");
+                    };
 
                     // For debugging
                     assert!(x.1 == a);
 
-                    println!("Priority at current step {:?} for {}",x, a);
+                    println!("Priority at current step {:?} for {}", x, a);
                     if cost == 0 {
                         x.0 -= x.0.floor();
-                    }
-                    else {
+                    } else {
                         x.0 += 1.0;
                         flg_fin = false;
                     }
@@ -1044,11 +1116,15 @@ impl HetPiBT {
                 a.partial_cmp(b).unwrap()
             });
 
-            last_prio =
-            agent_priorities.iter().enumerate().filter(|p| p.1.is_some())
-            .map(|(ind, opt)|{
-                let (_,b )= opt.unwrap();
-                (b,ind)}).collect();
+            last_prio = agent_priorities
+                .iter()
+                .enumerate()
+                .filter(|p| p.1.is_some())
+                .map(|(ind, opt)| {
+                    let (_, b) = opt.unwrap();
+                    (b, ind)
+                })
+                .collect();
             for &agent in &agent_priorities {
                 let Some((_cost, agent_id)) = agent else {
                     continue;
