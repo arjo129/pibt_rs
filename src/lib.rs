@@ -258,6 +258,20 @@ pub fn parse_scen(file_name: &str) -> Result<Vec<Vec<(usize, usize)>>, std::num:
     Ok(vec![starts, ends])
 }
 
+/// Conflict Type
+#[derive(Debug, Clone, Copy)]
+enum ConflictType {
+    Swap,
+    Collision,
+}
+/// Conflict Tree Node
+#[derive(Debug, Clone, Copy)]
+struct ConflictTreeNode {
+    agents_involved: ((usize, usize), (usize, usize)),
+    time: usize,
+    conflict_type: ConflictType,
+}
+
 /// When converting between coordinate space, the grid clip mode
 /// is in charge of figuring out how to handle rounding.
 enum GridClipMode {
@@ -281,7 +295,7 @@ impl MultiGridCollisionChecker {
 
         // Get the grid sizes
         let mut grids = vec![];
-        for (id, &grid_size) in self.grid_sizes.iter().enumerate() {
+        for (id, &_grid_size) in self.grid_sizes.iter().enumerate() {
             if id == grid_id {
                 continue;
             }
@@ -318,18 +332,22 @@ impl MultiGridCollisionChecker {
         }
     }
 
-    fn build_moving_obstacle_map(&self, trajectories: &Vec<Vec<Vec<(i64, i64)>>>, boundaries: Vec<(usize,usize)>) -> Result<(),()> {
+    fn build_moving_obstacle_map(
+        &self,
+        trajectories: &Vec<Vec<Vec<(i64, i64)>>>,
+        boundaries: Vec<(usize, usize)>,
+    ) -> Result<Vec<ConflictTreeNode>, ()> {
         // agent_map
         let mut agent_map: Vec<Vec<Vec<Vec<Option<usize>>>>> = vec![];
-        //let mut conflicts = vec![];
+        let mut conflicts = vec![];
         // Assume all agents are the same.
         for graph in 0..trajectories.len() {
             let mut graphs_map = vec![];
             for t in 0..trajectories[graph].len() {
                 let mut grid = vec![vec![None; boundaries[graph].0]; boundaries[graph].1];
                 for agent in 0..trajectories[graph][t].len() {
-                    let (ax,ay) = trajectories[graph][t][agent];
-                    if ax < 0 ||ay < 0 {
+                    let (ax, ay) = trajectories[graph][t][agent];
+                    if ax < 0 || ay < 0 {
                         return Err(());
                     }
                     grid[ax as usize][ay as usize] = Some(agent);
@@ -343,16 +361,20 @@ impl MultiGridCollisionChecker {
         for graph in 0..trajectories.len() {
             for t in 0..trajectories[graph].len() {
                 for agent in 0..trajectories[graph][t].len() {
-                    let (ax,ay) = trajectories[graph][t][agent];
+                    let (ax, ay) = trajectories[graph][t][agent];
                     let nodes = self.get_blocked_nodes(graph, ax as usize, ay as usize);
                     for node in nodes {
                         // Only consider multi-fleet
-                        if node.0 ==graph {
+                        if node.0 == graph {
                             continue;
                         }
-                        if agent_map[node.0][t][node.1][node.2].is_some() {
-                           // Mark conflict
-
+                        if let Some(agent1) = agent_map[node.0][t][node.1][node.2] {
+                            // Mark conflict
+                            conflicts.push(ConflictTreeNode {
+                                agents_involved: ((node.0, agent1), (graph, agent)),
+                                time: t,
+                                conflict_type: ConflictType::Collision,
+                            });
                         }
 
                         // Handle swap
@@ -361,22 +383,60 @@ impl MultiGridCollisionChecker {
                             continue;
                         }
 
-                        let (from_x, from_y) = trajectories[graph][t-1][agent];
-                        if let Some(agent ) = agent_map[graph][t][from_x as usize][from_y as usize] {
-                            if Some(agent) == agent_map[node.0][t][node.1][node.2] {
-
+                        let (from_x, from_y) = trajectories[graph][t - 1][agent];
+                        let (from_x, from_y) = (from_x as usize, from_y as usize);
+                        let blocked_nodes = self.get_blocked_nodes(graph, from_x, from_y);
+                        for (graph2, x2, y2) in blocked_nodes {
+                            if let Some(agent1) = agent_map[graph2][t][x2][y2] {
+                                if agent_map[node.0][t - 1][node.1][node.2]
+                                    == agent_map[graph2][t][x2][y2]
+                                {
+                                    conflicts.push(ConflictTreeNode {
+                                        agents_involved: ((node.0, agent1), (graph, agent)),
+                                        time: t,
+                                        conflict_type: ConflictType::Swap,
+                                    });
+                                }
                             }
-                            /*if self.occupied[time - 1][trajectory.graph_id][x][y].contains(agent) {
-                                return Ok(None);
-                            }*/
                         }
                     }
                 }
             }
         }
-        Ok(())
+        Ok(conflicts)
     }
 }
+
+#[cfg(test)]
+#[test]
+fn test_disjoint_split() {
+    let fleet1= vec![
+        vec![(0,0), (0,1), (2,2)],
+        vec![(1,0), (0,2), (2,3)]];
+    let fleet2 = vec![vec![(1,0)], vec![(0,0)]];
+
+    let mut collision_checker= MultiGridCollisionChecker {
+        grid_sizes: vec![1.0,2.0]
+    };
+    let res = collision_checker.build_moving_obstacle_map(
+        &vec![fleet1, fleet2], vec![(5,5),(5,5)]);
+    println!("{:?}", res);
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap().len(), 2);
+
+    let fleet1= vec![
+        vec![(1,0)],
+        vec![(2,0)]];
+    let fleet2 = vec![vec![(1,0)], vec![(0,0)]];
+
+    let res = collision_checker.build_moving_obstacle_map(
+        &vec![fleet1, fleet2], vec![(5,5),(5,5)]);
+    println!("{:?}", res);
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap().len(), 2);
+
+}
+
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeterogenousTrajectory {
@@ -732,7 +792,9 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
             if !self
                 .dont_occupy
                 .contains(&(parent_graph, parent_x, parent_y))
-                || self.distance_grid[self.agent][parent_x][parent_y] == 0 ||(self.curr_loc == (parent_graph, parent_x, parent_y) && curr_time != self.start_time)
+                || self.distance_grid[self.agent][parent_x][parent_y] == 0
+                || (self.curr_loc == (parent_graph, parent_x, parent_y)
+                    && curr_time != self.start_time)
             {
                 // Backtrack
                 let mut node = (curr_time, parent_graph, parent_x, parent_y);
