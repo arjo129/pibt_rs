@@ -1,6 +1,7 @@
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    rc::Rc,
 };
 
 mod collision_checker;
@@ -260,16 +261,61 @@ pub fn parse_scen(file_name: &str) -> Result<Vec<Vec<(usize, usize)>>, std::num:
 
 /// Conflict Type
 #[derive(Debug, Clone, Copy)]
-enum ConflictType {
+pub(crate) enum ConflictType {
     Swap,
     Collision,
 }
+
+type MultiGraphTrajectory = Vec<Vec<Vec<Vec<Option<usize>>>>>;
 /// Conflict Tree Node
-#[derive(Debug, Clone, Copy)]
-struct ConflictTreeNode {
-    agents_involved: ((usize, usize), (usize, usize)),
-    time: usize,
-    conflict_type: ConflictType,
+#[derive(Debug, Clone)]
+pub(crate) struct ConflictTreeNode {
+    pub(crate) agents_involved: ((usize, usize), (usize, usize)),
+    pub(crate) time: usize,
+    pub(crate) conflict_type: ConflictType,
+    pub(crate) trajectory_map: Rc<MultiGraphTrajectory>,
+}
+
+impl ConflictTreeNode {
+    pub(crate) fn is_move_safe(
+        &self,
+        grid_id: usize,
+        from: (usize, usize),
+        to: (usize, usize),
+        t: usize,
+        collision_checker: &MultiGridCollisionChecker,
+    ) -> bool {
+        let occupying_from = collision_checker.get_blocked_nodes(grid_id, from.0, from.1);
+        let occupying_to = collision_checker.get_blocked_nodes(grid_id, to.0, to.1);
+
+        // Head-on-collision
+        for &(g, x, y) in &occupying_to {
+            if self.trajectory_map[g][t][x][y].is_some() {
+                return false;
+            }
+        }
+
+        if t < 1 {
+            return true;
+        }
+
+        // Swap
+        for &(g, x, y) in &occupying_from {
+            if self.trajectory_map[g][t][x][y].is_some() {
+                for &(g2, x2, y2) in &occupying_from {
+                    if g2 != g {
+                        continue;
+                    }
+
+                    if self.trajectory_map[g][t][x][y] == self.trajectory_map[g][t - 1][x2][y2] {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
 }
 
 /// When converting between coordinate space, the grid clip mode
@@ -280,10 +326,10 @@ enum GridClipMode {
 }
 
 /// Internal collision checking structure for mapping between grid cells
-struct MultiGridCollisionChecker {
+pub(crate) struct MultiGridCollisionChecker {
     /// The size of an individual grid.
     /// It is assumed that each grid starts at the same top left corner
-    grid_sizes: Vec<f32>,
+    pub(crate) grid_sizes: Vec<f32>,
 }
 
 impl MultiGridCollisionChecker {
@@ -338,7 +384,7 @@ impl MultiGridCollisionChecker {
         boundaries: Vec<(usize, usize)>,
     ) -> Result<Vec<ConflictTreeNode>, ()> {
         // agent_map
-        let mut agent_map: Vec<Vec<Vec<Vec<Option<usize>>>>> = vec![];
+        let mut agent_map = vec![];
         let mut conflicts = vec![];
         // Assume all agents are the same.
         for graph in 0..trajectories.len() {
@@ -357,6 +403,8 @@ impl MultiGridCollisionChecker {
             agent_map.push(graphs_map);
         }
 
+        let agent_map = Rc::new(agent_map);
+
         // Assume all agents are the same.
         for graph in 0..trajectories.len() {
             for t in 0..trajectories[graph].len() {
@@ -374,6 +422,7 @@ impl MultiGridCollisionChecker {
                                 agents_involved: ((node.0, agent1), (graph, agent)),
                                 time: t,
                                 conflict_type: ConflictType::Collision,
+                                trajectory_map: agent_map.clone(),
                             });
                         }
 
@@ -395,6 +444,7 @@ impl MultiGridCollisionChecker {
                                         agents_involved: ((node.0, agent1), (graph, agent)),
                                         time: t,
                                         conflict_type: ConflictType::Swap,
+                                        trajectory_map: agent_map.clone(),
                                     });
                                 }
                             }
@@ -410,33 +460,27 @@ impl MultiGridCollisionChecker {
 #[cfg(test)]
 #[test]
 fn test_disjoint_split() {
-    let fleet1= vec![
-        vec![(0,0), (0,1), (2,2)],
-        vec![(1,0), (0,2), (2,3)]];
-    let fleet2 = vec![vec![(1,0)], vec![(0,0)]];
+    let fleet1 = vec![vec![(0, 0), (0, 1), (2, 2)], vec![(1, 0), (0, 2), (2, 3)]];
+    let fleet2 = vec![vec![(1, 0)], vec![(0, 0)]];
 
-    let mut collision_checker= MultiGridCollisionChecker {
-        grid_sizes: vec![1.0,2.0]
+    let mut collision_checker = MultiGridCollisionChecker {
+        grid_sizes: vec![1.0, 2.0],
     };
-    let res = collision_checker.build_moving_obstacle_map(
-        &vec![fleet1, fleet2], vec![(5,5),(5,5)]);
+    let res =
+        collision_checker.build_moving_obstacle_map(&vec![fleet1, fleet2], vec![(5, 5), (5, 5)]);
     println!("{:?}", res);
     assert!(res.is_ok());
     assert_eq!(res.unwrap().len(), 2);
 
-    let fleet1= vec![
-        vec![(1,0)],
-        vec![(2,0)]];
-    let fleet2 = vec![vec![(1,0)], vec![(0,0)]];
+    let fleet1 = vec![vec![(1, 0)], vec![(2, 0)]];
+    let fleet2 = vec![vec![(1, 0)], vec![(0, 0)]];
 
-    let res = collision_checker.build_moving_obstacle_map(
-        &vec![fleet1, fleet2], vec![(5,5),(5,5)]);
+    let res =
+        collision_checker.build_moving_obstacle_map(&vec![fleet1, fleet2], vec![(5, 5), (5, 5)]);
     println!("{:?}", res);
     assert!(res.is_ok());
     assert_eq!(res.unwrap().len(), 2);
-
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeterogenousTrajectory {
@@ -1246,9 +1290,14 @@ fn test_best_first_search() {
         1,
     );
     let paths: Vec<_> = search.collect();
-    assert_eq!(paths.len(), 2);
+    println!("{:?}", paths);
+    assert_eq!(paths.len(), 3);
+    // Best case we try to move near the goal forcing the blocking agent out
     assert_eq!(paths[0].path, vec![(1, 0, 0), (1, 0, 1)]);
-    assert_eq!(paths[1].path, vec![(1, 0, 0), (1, 1, 0)]);
+    // Second best case is we stay put
+    assert_eq!(paths[1].path, vec![(1, 0, 0), (1, 0, 0)]);
+    // We could oscillate out of the way but it is much less desireable
+    assert_eq!(paths[2].path, vec![(1, 0, 0), (1, 1, 0)]);
     assert_eq!(paths[0].need_to_moveout, [0]);
     assert_eq!(paths[1].need_to_moveout, []);
 }

@@ -1,4 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::Mul};
+
+use crate::{ConflictTreeNode, MultiGridCollisionChecker, collision_checker};
 
 /// Vanilla priority based inheritance
 ///
@@ -37,6 +39,8 @@ impl PiBTWithConstraints {
         starts: &Vec<(usize, usize)>,
         ends: &Vec<(usize, usize)>,
         max_time: usize,
+        constraints: &Vec<ConflictTreeNode>,
+        collision_checker: &MultiGridCollisionChecker,
     ) -> Result<Vec<Vec<(i64, i64)>>, ()> {
         let mut priorities = vec![];
         // SSSP for individual agents
@@ -91,7 +95,7 @@ impl PiBTWithConstraints {
             agents.sort_by(|p, q| priorities[*p].cmp(&priorities[*q]));
             for agent in agents {
                 if self.q[t][agent] == (-1, -1) {
-                    self.pibt(agent, t - 1);
+                    self.pibt(agent, t - 1, constraints, collision_checker);
                 }
             }
 
@@ -123,7 +127,14 @@ impl PiBTWithConstraints {
     /// Implements vanilla PiBT for high speed multi-robot planning.
     /// - agent: usize
     /// - time: usize
-    fn pibt(&mut self, agent: usize, time: usize) {
+    /// - Conflicts: Constraints set by CBS
+    fn pibt(
+        &mut self,
+        agent: usize,
+        time: usize,
+        conflicts: &Vec<ConflictTreeNode>,
+        collision_checker: &MultiGridCollisionChecker,
+    ) {
         // (Agent, items to reserve in stack)
         let mut stack: Vec<(usize, Vec<(usize, usize, usize)>)> = vec![(agent, vec![])];
 
@@ -164,6 +175,16 @@ impl PiBTWithConstraints {
                 if self.other_agents[time + 1][x][y].is_some() {
                     continue;
                 }
+                // Check conflict tree, if its unsafe skip.
+                for conflict in conflicts {
+                    conflict.is_move_safe(
+                        conflict.agents_involved.0.0,
+                        (q_from.0 as usize, q_from.1 as usize),
+                        (x, y),
+                        time + 1,
+                        collision_checker,
+                    );
+                }
                 // Swap conflict prevention
                 if let Some(agent_to_check) = self.other_agents[time][x][y] {
                     // There is an agent on the destination square at the current time
@@ -202,4 +223,32 @@ impl PiBTWithConstraints {
             }
         }
     }
+}
+
+
+pub fn hierarchical_cbs_pibt(
+    starts: Vec<(usize, usize, usize)>,
+    ends: Vec<(usize, usize)>,
+    bounds: Vec<(usize, usize)>,
+    grid_sizes: Vec<f32>
+) {
+    let mut agent_to_graph = vec![];
+    let mut max_graph = 0;
+    for &(graph,_, _) in &starts  {
+        max_graph = max_graph.max(graph);
+    }
+    let mut pibt_starts = vec![vec![]; max_graph + 1];
+    let mut pibt_ends = vec![vec![]; max_graph + 1];
+    let mut graph_to_agent = vec![vec![]; max_graph + 1];
+
+    for (index, &start) in starts.iter().enumerate()  {
+        pibt_starts[start.0].push((start.1,start.2));
+        pibt_ends[start.0].push(ends[index]);
+        graph_to_agent[start.0].push(index);
+        agent_to_graph.push((start.0, pibt_starts[start.0].len()-1));
+    }
+
+    let mut collision_checker = MultiGridCollisionChecker {
+        grid_sizes
+    };
 }
