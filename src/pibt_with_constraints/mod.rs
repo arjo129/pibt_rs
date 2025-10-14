@@ -225,30 +225,63 @@ impl PiBTWithConstraints {
     }
 }
 
-
 pub fn hierarchical_cbs_pibt(
     starts: Vec<(usize, usize, usize)>,
     ends: Vec<(usize, usize)>,
     bounds: Vec<(usize, usize)>,
-    grid_sizes: Vec<f32>
+    grid_sizes: Vec<f32>,
 ) {
     let mut agent_to_graph = vec![];
     let mut max_graph = 0;
-    for &(graph,_, _) in &starts  {
+    for &(graph, _, _) in &starts {
         max_graph = max_graph.max(graph);
     }
     let mut pibt_starts = vec![vec![]; max_graph + 1];
     let mut pibt_ends = vec![vec![]; max_graph + 1];
     let mut graph_to_agent = vec![vec![]; max_graph + 1];
 
-    for (index, &start) in starts.iter().enumerate()  {
-        pibt_starts[start.0].push((start.1,start.2));
-        pibt_ends[start.0].push(ends[index]);
-        graph_to_agent[start.0].push(index);
-        agent_to_graph.push((start.0, pibt_starts[start.0].len()-1));
+    let mut pibts = vec![];
+
+    for &bound in &bounds {
+        // TODO(arjoc)
+        pibts.push(PiBTWithConstraints::init_empty_world(bound.0, bound.1));
     }
 
-    let mut collision_checker = MultiGridCollisionChecker {
-        grid_sizes
-    };
+    for (index, &start) in starts.iter().enumerate() {
+        pibt_starts[start.0].push((start.1, start.2));
+        pibt_ends[start.0].push(ends[index]);
+        graph_to_agent[start.0].push(index);
+        agent_to_graph.push((start.0, pibt_starts[start.0].len() - 1));
+    }
+
+    let mut collision_checker = MultiGridCollisionChecker { grid_sizes };
+
+    let mut conflict_list = VecDeque::new();
+    conflict_list.push_front(vec![]);
+
+    while let Some(p) = conflict_list.pop_back() {
+        let mut result = vec![];
+        for g_id in 0..pibts.len() {
+            let Ok(p) = pibts[g_id].solve(
+                &pibt_starts[g_id],
+                &pibt_ends[g_id],
+                1000,
+                &vec![],
+                &collision_checker,
+            ) else {
+                panic!("Unsolvable");
+            };
+            result.push(p);
+        }
+
+        let Ok(conflicts) = collision_checker.build_moving_obstacle_map(&result, &bounds) else {
+            panic!("Some inconsistency occured");
+        };
+        if conflicts.len() == 0 {
+            return;
+        }
+        for conflict in conflicts {
+            conflict_list.push_front(vec![conflict]);
+        }
+    }
 }

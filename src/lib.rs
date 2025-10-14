@@ -320,16 +320,16 @@ impl ConflictTreeNode {
 
 /// When converting between coordinate space, the grid clip mode
 /// is in charge of figuring out how to handle rounding.
-enum GridClipMode {
+pub enum GridClipMode {
     ConservativeTopLeft,
     ConservativeBottomRight,
 }
 
 /// Internal collision checking structure for mapping between grid cells
-pub(crate) struct MultiGridCollisionChecker {
+pub struct MultiGridCollisionChecker {
     /// The size of an individual grid.
     /// It is assumed that each grid starts at the same top left corner
-    pub(crate) grid_sizes: Vec<f32>,
+    pub grid_sizes: Vec<f32>,
 }
 
 impl MultiGridCollisionChecker {
@@ -362,7 +362,8 @@ impl MultiGridCollisionChecker {
         return grids;
     }
 
-    fn get_grid_space(&self, grid_id: usize, x: f32, y: f32, mode: GridClipMode) -> (usize, usize) {
+    // Takes in an (x,y) coordinate and returns the grid occupying it currently.
+    pub fn get_grid_space(&self, grid_id: usize, x: f32, y: f32, mode: GridClipMode) -> (usize, usize) {
         let coords = (
             (x / self.grid_sizes[grid_id]),
             (y / self.grid_sizes[grid_id]),
@@ -381,7 +382,7 @@ impl MultiGridCollisionChecker {
     fn build_moving_obstacle_map(
         &self,
         trajectories: &Vec<Vec<Vec<(i64, i64)>>>,
-        boundaries: Vec<(usize, usize)>,
+        boundaries: &Vec<(usize, usize)>,
     ) -> Result<Vec<ConflictTreeNode>, ()> {
         // agent_map
         let mut agent_map = vec![];
@@ -467,7 +468,7 @@ fn test_disjoint_split() {
         grid_sizes: vec![1.0, 2.0],
     };
     let res =
-        collision_checker.build_moving_obstacle_map(&vec![fleet1, fleet2], vec![(5, 5), (5, 5)]);
+        collision_checker.build_moving_obstacle_map(&vec![fleet1, fleet2], &vec![(5, 5), (5, 5)]);
     println!("{:?}", res);
     assert!(res.is_ok());
     assert_eq!(res.unwrap().len(), 2);
@@ -476,7 +477,7 @@ fn test_disjoint_split() {
     let fleet2 = vec![vec![(1, 0)], vec![(0, 0)]];
 
     let res =
-        collision_checker.build_moving_obstacle_map(&vec![fleet1, fleet2], vec![(5, 5), (5, 5)]);
+        collision_checker.build_moving_obstacle_map(&vec![fleet1, fleet2], &vec![(5, 5), (5, 5)]);
     println!("{:?}", res);
     assert!(res.is_ok());
     assert_eq!(res.unwrap().len(), 2);
