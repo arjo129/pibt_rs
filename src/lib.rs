@@ -237,6 +237,53 @@ pub fn parse_grid(file_name: &str) -> Vec<Vec<usize>> {
     grid
 }
 
+pub fn parse_grid_with_scale(file_name: &str, scale: usize) -> Vec<Vec<usize>> {
+    let content = std::fs::read_to_string(file_name).expect("Failed to read the file");
+    let mut scaled_grid = Vec::new(); // Changed name for clarity
+    let mut lines = content.lines();
+
+    // Skip the header lines
+    lines.next(); // type octile
+    lines.next(); // height
+    lines.next(); // width
+    lines.next(); // map
+
+    // Check if scale is valid to prevent infinite loops or panics
+    let final_scale = if scale == 0 { 1 } else { scale };
+
+    for line in lines {
+        let mut original_row = Vec::new();
+        for char in line.chars() {
+            match char {
+                '.' => original_row.push(0),
+                '@' => original_row.push(1),
+                _ => continue,
+            }
+        }
+
+        if original_row.is_empty() {
+            continue;
+        }
+
+        // 1. Scale the row horizontally
+        let mut scaled_row = Vec::new();
+        for &cell_value in original_row.iter() {
+            // Repeat the cell value `final_scale` times
+            for _ in 0..final_scale {
+                scaled_row.push(cell_value);
+            }
+        }
+
+        // 2. Scale the row vertically
+        // Repeat the entire scaled row `final_scale` times
+        for _ in 0..final_scale {
+            scaled_grid.push(scaled_row.clone()); // Use clone to push a copy of the row
+        }
+    }
+
+    scaled_grid
+}
+
 pub fn parse_scen(file_name: &str) -> Result<Vec<Vec<(usize, usize)>>, std::num::ParseIntError> {
     let content = std::fs::read_to_string(file_name).expect("Failed to read the file");
     let mut lines = content.lines();
@@ -363,7 +410,13 @@ impl MultiGridCollisionChecker {
     }
 
     // Takes in an (x,y) coordinate and returns the grid occupying it currently.
-    pub fn get_grid_space(&self, grid_id: usize, x: f32, y: f32, mode: GridClipMode) -> (usize, usize) {
+    pub fn get_grid_space(
+        &self,
+        grid_id: usize,
+        x: f32,
+        y: f32,
+        mode: GridClipMode,
+    ) -> (usize, usize) {
         let coords = (
             (x / self.grid_sizes[grid_id]),
             (y / self.grid_sizes[grid_id]),
@@ -606,6 +659,7 @@ impl HeterogenousReservationSystem {
 
             if self.occupied[time][trajectory.graph_id][x][y].len() != 0 {
                 // Spot is occupied
+                println!("Attempted to occupy a reserved spot");
                 return Ok(None);
             }
 
@@ -618,6 +672,7 @@ impl HeterogenousReservationSystem {
             let (from_x, from_y) = trajectory.positions[time_after_start - 1];
             for agent in &self.occupied[time][trajectory.graph_id][from_x][from_y] {
                 if self.occupied[time - 1][trajectory.graph_id][x][y].contains(agent) {
+                    println!("Attempted to swap.");
                     return Ok(None);
                 }
             }
@@ -654,6 +709,13 @@ impl HeterogenousReservationSystem {
                 .collision_checker
                 .get_blocked_nodes(trajectory.graph_id, x, y);
             for (graph_id, x, y) in nodes {
+                // Conversion may return out of bounds grids
+                if x >= self.occupied[time][graph_id].len() {
+                    continue;
+                }
+                if y >= self.occupied[time][graph_id][x].len() {
+                    continue;
+                }
                 self.occupied[time][graph_id][x][y].insert(agent_id);
                 self.agent_to_cells[time][agent_id].push((graph_id, x, y));
             }
@@ -800,6 +862,7 @@ struct BestFirstSearchInstance<'a, 'b, 'c> {
     pq: BinaryHeap<Reverse<(usize, usize, (usize, usize, usize))>>,
     came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
     agent: usize,
+    allow_stay_put: bool
 }
 
 impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
@@ -824,6 +887,7 @@ impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
             pq,
             came_from: HashMap::new(),
             agent,
+            allow_stay_put: true
         }
     }
 }
@@ -859,11 +923,18 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                         }
                     }
 
-                    let other_nodes = self
+                    let other_nodes: Vec<_> = self
                         .res_sys
                         .collision_checker
-                        .get_blocked_nodes(graph, x, y);
-                    for &(graph, x, y) in &other_nodes {
+                        .get_blocked_nodes(graph, x, y)
+                        .iter()
+                        .filter(|(g, x, y)| {
+                            self.res_sys.unassigned_agents[*g].len() > *x
+                                && self.res_sys.unassigned_agents[*g][*x].len() > *y
+                        })
+                        .cloned()
+                        .collect();
+                    for (graph, x, y) in other_nodes {
                         for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
                             if end_time_info.end_time <= time {
                                 agents_to_kickout.insert(*agent);
@@ -893,6 +964,10 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 })
                 .map(|(x, y)| (x as usize, y as usize))
                 .filter(|&(x, y)| self.distance_grid[self.agent][x][y] >= 0) // Static obstacles
+                .filter(|&(x, y)| {
+                    self.res_sys.occupied[curr_time + 1][parent_graph].len() > x
+                        && self.res_sys.occupied[curr_time + 1][parent_graph][x].len() > y
+                })
                 .filter(|&(x, y)| {
                     self.res_sys.occupied.len() >= (curr_time + 1)
                         || self.res_sys.occupied[curr_time + 1][parent_graph][x][y].len() == 0
@@ -975,6 +1050,12 @@ fn evaluate_individual_agent_cost(
                 let y = y as f32;
                 let x_idx = (x / graph_scale[agent.graph_id]) as usize;
                 let y_idx = (y / graph_scale[agent.graph_id]) as usize;
+                if x_idx >= distance_grid.len() {
+                    continue;
+                }
+                if y_idx >= distance_grid[x_idx].len() {
+                    continue;
+                }
                 distance_grid[x_idx][y_idx] = -1;
             }
         }
@@ -1050,99 +1131,142 @@ impl HetPiBT {
         else {
             return;
         };
-        let time = end_time.end_time - 1;
+        let time = end_time.end_time-1;
 
-        let mut stack = vec![];
-        stack.push((
-            agent_id,
-            HashSet::from_iter([(graph, x, y)].iter().cloned()),
+        let mut stack = VecDeque::new();
+
+        let mut blocked_nodes = HashSet::from_iter([(graph, x, y)].iter().cloned());
+        let search = BestFirstSearchInstance::create_search_instance(
+            &self.reservation_system,
+            &self.cost_map,
+            (graph, x, y),
+            &blocked_nodes,
+            time,
             forward_lookup,
-        ));
-        let mut will_affect = HashMap::new();
-        while let Some((agent_id, blocked_locations, forward_lookup)) = stack.pop() {
+            agent_id,
+        );
+        let mut will_affect: HashMap<usize, (usize, Vec<(usize, usize, usize)>)> = HashMap::new();
+        for path in search {
+            if path.need_to_moveout.len() > 1 {
+                continue;
+            }
+
+            println!("Starting agent at {:?}", (graph,x,y));
+            println!("Pushing path {:?}", path);
+            // Hack even though it DFS, we want the earliest node to be expanded to
+            // be the first one generated.
+            stack.push_back((agent_id, blocked_nodes.clone(), forward_lookup, 0, path));
+        }
+
+        while let Some((agent_id, blocked_locations, forward_lookup, depth, neighbour)) =
+            stack.pop_front()
+        {
+            println!("Expanding agent {} {:?}", agent_id, neighbour);
+            if neighbour.need_to_moveout.len() == 0 {
+                println!("Path is terminal");
+                let mut agent = agent_id;
+                let mut path_to_reserve = HeterogenousTrajectory {
+                    graph_id: neighbour.path[0].0,
+                    start_time: end_time.end_time.clone()+1,
+                    positions: neighbour.path.iter().map(|&(_, x, y)| (x, y)).collect(),
+                };
+                println!("Agent {}", agent);
+                println!("{:?}", path_to_reserve);
+                self.reservation_system
+                    .reserve_trajectory(&path_to_reserve, agent_id)
+                    .map_err(|p| panic!("{:?}", p));
+
+                println!("Chosen path for agent {}: {:?}", agent_id, path_to_reserve);
+
+                // Cascade the delays back up the chain
+                while let Some((agent_id, path)) = will_affect.get(&agent) {
+                    agent = *agent_id;
+                    let mut hypot_path = HeterogenousTrajectory {
+                        graph_id: path[0].0,
+                        start_time: path_to_reserve.start_time,
+                        positions: path.iter().map(|&(_, x, y)| (x, y)).collect(),
+                    };
+                    while let Err(p) = self
+                        .reservation_system
+                        .reserve_trajectory(&hypot_path, *agent_id)
+                    {
+                        panic!("{:?}", p);
+                        hypot_path.start_time += 1;
+                    }
+                    println!("Chosen path for agent {}: {:?}", agent_id, hypot_path);
+                }
+                return;
+            }
+
+            println!("Exploring path for {}, {}", agent_id, depth);
+            let mut c = blocked_locations.clone();
+            for &p in &neighbour.path {
+                c.insert(p);
+            }
+
+            if will_affect.contains_key(&neighbour.need_to_moveout[0]) || neighbour.need_to_moveout.len() > 1 {
+                // Deadlock. Do not proceed
+                println!("Deadlock");
+                continue;
+            }
+
+            let my_size = self.reservation_system.collision_checker.grid_sizes
+                [self.reservation_system.agent_to_graph[agent_id].unwrap()];
+            let other_size = self.reservation_system.collision_checker.grid_sizes
+                [self.reservation_system.agent_to_graph[neighbour.need_to_moveout[0]].unwrap()];
+            let mut forward_lookup = forward_lookup;
+            if other_size < my_size {
+                let factor = (my_size / other_size).round() as usize;
+                forward_lookup *= factor * factor;
+            }
+            let Some(p) = self.reservation_system.agent_last_location.get(&neighbour.need_to_moveout[0]) else {
+                continue;
+            };
+
+             let Some(end_time) = self.reservation_system.unassigned_agents[p.0][p.1][p.2].get(&neighbour.need_to_moveout[0]) else {
+                continue;
+            };
+
+            c.insert(*p);
+            println!("pos: {:?} {:?} {}", p, c, forward_lookup);
             // Try to get the robot to move out
             let search = BestFirstSearchInstance::create_search_instance(
                 &self.reservation_system,
                 &self.cost_map,
-                (graph, x, y),
-                &blocked_locations,
-                time,
+                *p,
+                &c,
+                end_time.end_time - 1,
                 forward_lookup,
-                agent_id,
+                neighbour.need_to_moveout[0],
             );
-            let proposals: Vec<_> = search.collect();
-            for neighbour in proposals {
-                if neighbour.need_to_moveout.len() > 1 {
+            for path in search {
+                if path.need_to_moveout.len() > 1 {
                     continue;
                 }
-                if neighbour.need_to_moveout.len() == 1 {
-                    let mut c = blocked_locations.clone();
-                    for &p in &neighbour.path {
-                        c.insert(p);
-                    }
 
-                    if will_affect.contains_key(&neighbour.need_to_moveout[0]) {
-                        // Deadlock. Do not proceed
-                        continue;
-                    }
-
-                    let my_size = self.reservation_system.collision_checker.grid_sizes
-                        [self.reservation_system.agent_to_graph[agent_id].unwrap()];
-                    let other_size = self.reservation_system.collision_checker.grid_sizes[self
-                        .reservation_system
-                        .agent_to_graph[neighbour.need_to_moveout[0]]
-                        .unwrap()];
-                    let mut forward_lookup = forward_lookup;
-                    if other_size < my_size {
-                        let factor = (my_size / other_size).round() as usize;
-                        forward_lookup *= factor * factor;
-                    }
-                    stack.push((neighbour.need_to_moveout[0], c, forward_lookup));
-                    will_affect.insert(
-                        neighbour.need_to_moveout[0],
-                        (agent_id, neighbour.path.clone()),
-                    );
-                } else {
-                    let mut agent = agent_id;
-                    let path_to_reserve = HeterogenousTrajectory {
-                        graph_id: neighbour.path[0].0,
-                        start_time: end_time.end_time.clone(),
-                        positions: neighbour.path.iter().map(|&(_, x, y)| (x, y)).collect(),
-                    };
-                    println!("Agent {}", agent);
-                    println!("{:?}", path_to_reserve);
-                    self.reservation_system
-                        .reserve_trajectory(&path_to_reserve, agent_id)
-                        .map_err(|p| panic!("{:?}", p));
-
-                    // Cascade the delays back up the chain
-                    while let Some((agent_id, path)) = will_affect.get(&agent) {
-                        agent = *agent_id;
-                        let mut hypot_path = HeterogenousTrajectory {
-                            graph_id: path[0].0,
-                            start_time: path_to_reserve.start_time,
-                            positions: path.iter().map(|&(_, x, y)| (x, y)).collect(),
-                        };
-                        while let Err(p) = self
-                            .reservation_system
-                            .reserve_trajectory(&hypot_path, *agent_id)
-                        {
-                            hypot_path.start_time += 1;
-                        }
-                    }
-                    return;
-                }
+                will_affect.insert(
+                    neighbour.need_to_moveout[0],
+                    (agent_id, neighbour.path.clone()),
+                );
+                println!("Adding path for {} {:?}", neighbour.need_to_moveout[0], path);
+                stack.push_front((
+                    neighbour.need_to_moveout[0],
+                    c.clone(),
+                    forward_lookup,
+                    depth + 1,
+                    path,
+                ));
             }
-            let path_to_reserve = HeterogenousTrajectory {
-                graph_id: graph,
-                start_time: end_time.end_time.clone(),
-                positions: vec![(x, y)],
-            };
-            self.reservation_system
-                .reserve_trajectory(&path_to_reserve, agent_id)
-                .unwrap();
-            return;
         }
+        let path_to_reserve = HeterogenousTrajectory {
+            graph_id: graph,
+            start_time: end_time.end_time.clone(),
+            positions: vec![(x, y)],
+        };
+        self.reservation_system
+            .reserve_trajectory(&path_to_reserve, agent_id)
+            .unwrap();
+        return;
     }
 
     pub fn solve(&mut self, max_time_steps: usize) -> Option<usize> {
@@ -1173,6 +1297,7 @@ impl HetPiBT {
             let agents = 0..self.reservation_system.max_agents;
             let mut flg_fin = true;
             let mut checked = false;
+            println!("===========================================");
             self.reservation_system.extend_by_one_timestep();
             for a in agents {
                 let agent = self
