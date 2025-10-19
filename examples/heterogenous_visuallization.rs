@@ -126,7 +126,7 @@ async fn main() {
         agents.clone(),
     );
     println!("Calculated individual agent cost maps");
-    let result = het_pibt.solve(5);
+    let result = het_pibt.solve(50);
     println!("Result time: {:?}", result);
     let mut last_update = std::time::SystemTime::now();
     let mut time = 0;

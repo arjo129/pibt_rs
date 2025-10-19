@@ -620,9 +620,15 @@ impl HeterogenousReservationSystem {
         trajectory: &HeterogenousTrajectory,
         agent_id: usize,
     ) -> Result<Option<usize>, ReservationError> {
+
+        println!("DEBUG: {}", line!());
+
         if agent_id >= self.max_agents {
             return Err(ReservationError::ExceedMaxAgents);
         }
+
+                println!("DEBUG: {}", line!());
+
         if let Some(agent_graph) = self.agent_to_graph[agent_id] {
             if trajectory.graph_id != agent_graph {
                 return Err(ReservationError::AgentSwappedGraphs);
@@ -630,6 +636,8 @@ impl HeterogenousReservationSystem {
         } else {
             self.agent_to_graph[agent_id] = Some(trajectory.graph_id);
         }
+                println!("DEBUG: {}", line!());
+
         for (time_after_start, &position) in trajectory.positions.iter().enumerate() {
             let time = time_after_start + trajectory.start_time;
             if time >= self.occupied.len() {
@@ -650,6 +658,8 @@ impl HeterogenousReservationSystem {
                 ));
             }
             if self.occupied[time][trajectory.graph_id][x].len() < y {
+                println!("Out of bounds");
+
                 return Err(ReservationError::OutOfGraphBounds(
                     trajectory.graph_id,
                     x,
@@ -657,9 +667,12 @@ impl HeterogenousReservationSystem {
                 ));
             }
 
+            println!("DEBUG: {}", line!());
+
+
             if self.occupied[time][trajectory.graph_id][x][y].len() != 0 {
                 // Spot is occupied
-                println!("Attempted to occupy a reserved spot");
+                println!("Attempted to occupy a reserved spot t={} p = {}, {}, {}", time, trajectory.graph_id,x,y);
                 return Ok(None);
             }
 
@@ -678,50 +691,13 @@ impl HeterogenousReservationSystem {
             }
         }
 
+        println!("Attemping registration");
         let mut effective_start = trajectory.start_time.min(self.occupied.len());
+        println!("DEBUG: {}", line!());
 
-        for (time_after_start, &position) in trajectory.positions.iter().enumerate() {
-            let time = time_after_start + trajectory.start_time;
-            while time >= self.occupied.len() {
-                self.extend_by_one_timestep();
-                let Some(&(g, x, y)) = self.agent_last_location.get(&agent_id) else {
-                    let (x, y) = trajectory.positions[0];
-                    let g = trajectory.graph_id;
-                    self.occupied[time][g][x][y].insert(agent_id);
-                    self.agent_to_cells[time][agent_id].push((g, x, y));
-                    for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
-                        self.occupied[time][g][x][y].insert(agent_id);
-                        self.agent_to_cells[time][agent_id].push((g, x, y));
-                    }
-                    continue;
-                };
-                self.occupied[time][g][x][y].insert(agent_id);
-                self.agent_to_cells[time][agent_id].push((g, x, y));
-                for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
-                    self.occupied[time][g][x][y].insert(agent_id);
-                    self.agent_to_cells[time][agent_id].push((g, x, y));
-                }
-            }
-            let (x, y) = position;
-            self.occupied[time][trajectory.graph_id][x][y].insert(agent_id);
-            self.agent_to_cells[time][agent_id].push((trajectory.graph_id, x, y));
-            let nodes = self
-                .collision_checker
-                .get_blocked_nodes(trajectory.graph_id, x, y);
-            for (graph_id, x, y) in nodes {
-                // Conversion may return out of bounds grids
-                if x >= self.occupied[time][graph_id].len() {
-                    continue;
-                }
-                if y >= self.occupied[time][graph_id][x].len() {
-                    continue;
-                }
-                self.occupied[time][graph_id][x][y].insert(agent_id);
-                self.agent_to_cells[time][agent_id].push((graph_id, x, y));
-            }
-        }
 
-        let Some(&(last_x, last_y)) = trajectory.positions.last() else {
+        /// Mark the end location and time.
+         let Some(&(last_x, last_y)) = trajectory.positions.last() else {
             return Err(ReservationError::TrajectoryEmpty);
         };
         let mut previous_traj = None;
@@ -732,6 +708,7 @@ impl HeterogenousReservationSystem {
             }
         }
         let new_end_time = trajectory.start_time + trajectory.positions.len();
+        println!("Assigning last trajectoty {} {} {}", agent_id, last_x, last_y);
         self.agent_last_location
             .insert(agent_id, (trajectory.graph_id, last_x, last_y));
         self.unassigned_agents[trajectory.graph_id][last_x][last_y].insert(
@@ -751,6 +728,55 @@ impl HeterogenousReservationSystem {
             },
         );
         self.trajectory_max_id += 1;
+
+        for (time_after_start, &position) in trajectory.positions.iter().enumerate() {
+            let time = time_after_start + trajectory.start_time;
+            ///// BUGGY CODE!!!!
+            while time >= self.occupied.len() {
+                println!("EXTENDING CAUSE TIME GAP SENSED");
+                self.extend_by_one_timestep();
+                let Some(&(g, x, y)) = self.agent_last_location.get(&agent_id) else {
+                    let (x, y) = trajectory.positions[0];
+                    let g = trajectory.graph_id;
+                    self.occupied[time][g][x][y].insert(agent_id);
+                    self.agent_to_cells[time][agent_id].push((g, x, y));
+                    for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
+                        self.occupied[time][g][x][y].insert(agent_id);
+                        self.agent_to_cells[time][agent_id].push((g, x, y));
+                    }
+                    continue;
+                };
+                self.occupied[time][g][x][y].insert(agent_id);
+                self.agent_to_cells[time][agent_id].push((g, x, y));
+                for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
+                    self.occupied[time][g][x][y].insert(agent_id);
+                    self.agent_to_cells[time][agent_id].push((g, x, y));
+                }
+            }
+        println!("DEBUG: {}", line!());
+
+            let (x, y) = position;
+            println!("Marking t={}, p={} {} {}", time, trajectory.graph_id, x,y);
+            self.occupied[time][trajectory.graph_id][x][y].insert(agent_id);
+            self.agent_to_cells[time][agent_id].push((trajectory.graph_id, x, y));
+            let nodes = self
+                .collision_checker
+                .get_blocked_nodes(trajectory.graph_id, x, y);
+            for (graph_id, x, y) in nodes {
+                // Conversion may return out of bounds grids
+                if x >= self.occupied[time][graph_id].len() {
+                    continue;
+                }
+                if y >= self.occupied[time][graph_id][x].len() {
+                    continue;
+                }
+                println!("Marking due to collision t={}, p={} {} {}", time, graph_id, x,y);
+
+                self.occupied[time][graph_id][x][y].insert(agent_id);
+                self.agent_to_cells[time][agent_id].push((graph_id, x, y));
+            }
+        }
+
         Ok(Some(self.trajectory_max_id - 1))
     }
 
@@ -1152,7 +1178,7 @@ impl HetPiBT {
             }
 
             println!("Starting agent at {:?}", (graph,x,y));
-            println!("Pushing path {:?}", path);
+            println!("Pushing path  {:?} for agent {}", path, agent_id);
             // Hack even though it DFS, we want the earliest node to be expanded to
             // be the first one generated.
             stack.push_back((agent_id, blocked_nodes.clone(), forward_lookup, 0, path));
@@ -1167,16 +1193,16 @@ impl HetPiBT {
                 let mut agent = agent_id;
                 let mut path_to_reserve = HeterogenousTrajectory {
                     graph_id: neighbour.path[0].0,
-                    start_time: end_time.end_time.clone()+1,
+                    start_time: end_time.end_time.clone(),
                     positions: neighbour.path.iter().map(|&(_, x, y)| (x, y)).collect(),
                 };
                 println!("Agent {}", agent);
                 println!("{:?}", path_to_reserve);
-                self.reservation_system
-                    .reserve_trajectory(&path_to_reserve, agent_id)
-                    .map_err(|p| panic!("{:?}", p));
+                println!("First path for agent {}: {:?}", agent_id, path_to_reserve);
 
-                println!("Chosen path for agent {}: {:?}", agent_id, path_to_reserve);
+                 self
+                    .reservation_system
+                    .reserve_trajectory(&path_to_reserve, agent).unwrap();
 
                 // Cascade the delays back up the chain
                 while let Some((agent_id, path)) = will_affect.get(&agent) {
@@ -1186,13 +1212,9 @@ impl HetPiBT {
                         start_time: path_to_reserve.start_time,
                         positions: path.iter().map(|&(_, x, y)| (x, y)).collect(),
                     };
-                    while let Err(p) = self
+                    self
                         .reservation_system
-                        .reserve_trajectory(&hypot_path, *agent_id)
-                    {
-                        panic!("{:?}", p);
-                        hypot_path.start_time += 1;
-                    }
+                        .reserve_trajectory(&hypot_path, *agent_id).unwrap();
                     println!("Chosen path for agent {}: {:?}", agent_id, hypot_path);
                 }
                 return;
