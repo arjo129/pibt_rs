@@ -126,7 +126,7 @@ async fn main() {
         agents.clone(),
     );
     println!("Calculated individual agent cost maps");
-    let result = het_pibt.solve(50);
+    let result = het_pibt.solve(5000);
     println!("Result time: {:?}", result);
     let mut last_update = std::time::SystemTime::now();
     let mut time = 0;
@@ -143,20 +143,24 @@ async fn main() {
             }
         }
 
+        let colors = [RED, GREEN, BLUE, YELLOW, ORANGE, PURPLE, VIOLET];
         for (agent, px) in p.iter().enumerate() {
             if let Some((g, x, y)) = px {
                 let g_scale = graph_scale[*g];
-                let h_scale = 20.0;
+                let h_scale = 1.0;
                 let x = *x as f32;
                 let y = *y as f32;
                 let x = x * g_scale * h_scale + g_scale * h_scale / 2.0;
                 let y = y * g_scale * h_scale + g_scale * h_scale / 2.0;
-                draw_circle(x, y, h_scale * g_scale / 2.0, RED);
+                let color = colors[agent % colors.len()];
+                /// Draws a circle to the end goal
+                draw_circle(x, y, h_scale * g_scale / 2.0, color);
                 let end_x =
                     (agents[agent].end.0 as f32) * g_scale * h_scale + g_scale * h_scale / 2.0;
                 let end_y =
                     (agents[agent].end.1 as f32) * g_scale * h_scale + g_scale * h_scale / 2.0;
-                draw_line(x, y, end_x, end_y, 1.0, RED);
+                /// Draws a line to the goal
+                draw_line(x, y, end_x, end_y, 1.0, color);
             }
         }
 

@@ -736,8 +736,10 @@ impl HeterogenousReservationSystem {
                 println!("EXTENDING CAUSE TIME GAP SENSED");
                 self.extend_by_one_timestep();
                 let Some(&(g, x, y)) = self.agent_last_location.get(&agent_id) else {
+                    println!("Could not get last location for {}", agent_id);
                     let (x, y) = trajectory.positions[0];
                     let g = trajectory.graph_id;
+                    println!("Marking due to extension t={} p={:?}", time, (g,x,y));
                     self.occupied[time][g][x][y].insert(agent_id);
                     self.agent_to_cells[time][agent_id].push((g, x, y));
                     for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
@@ -746,9 +748,14 @@ impl HeterogenousReservationSystem {
                     }
                     continue;
                 };
+                println!("Extending {}", agent_id);
+                println!("Marking due to extension t={} p={:?}", time, (g,x,y));
+
                 self.occupied[time][g][x][y].insert(agent_id);
                 self.agent_to_cells[time][agent_id].push((g, x, y));
                 for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
+                    println!("Marking due to collision extension t={} p={:?}", time, (g,x,y));
+
                     self.occupied[time][g][x][y].insert(agent_id);
                     self.agent_to_cells[time][agent_id].push((g, x, y));
                 }
@@ -878,6 +885,9 @@ struct ProposedPath {
     path: Vec<(usize, usize, usize)>,
     need_to_moveout: Vec<usize>,
 }
+
+/// This is used to implement pathfinding given the WinPiBT
+/// concept of "Disentangled" paths.
 struct BestFirstSearchInstance<'a, 'b, 'c> {
     curr_loc: (usize, usize, usize),
     start_time: usize,
@@ -888,7 +898,6 @@ struct BestFirstSearchInstance<'a, 'b, 'c> {
     pq: BinaryHeap<Reverse<(usize, usize, (usize, usize, usize))>>,
     came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
     agent: usize,
-    allow_stay_put: bool
 }
 
 impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
@@ -913,7 +922,6 @@ impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
             pq,
             came_from: HashMap::new(),
             agent,
-            allow_stay_put: true
         }
     }
 }
@@ -1200,9 +1208,12 @@ impl HetPiBT {
                 println!("{:?}", path_to_reserve);
                 println!("First path for agent {}: {:?}", agent_id, path_to_reserve);
 
-                 self
+                while let Err(e) = self
                     .reservation_system
-                    .reserve_trajectory(&path_to_reserve, agent).unwrap();
+                    .reserve_trajectory(&path_to_reserve, agent) {
+                        println!("Delaying");
+                        path_to_reserve.start_time +=1;
+                    }
 
                 // Cascade the delays back up the chain
                 while let Some((agent_id, path)) = will_affect.get(&agent) {
@@ -1212,9 +1223,13 @@ impl HetPiBT {
                         start_time: path_to_reserve.start_time,
                         positions: path.iter().map(|&(_, x, y)| (x, y)).collect(),
                     };
-                    self
+                    while let Err(e) =  self
                         .reservation_system
-                        .reserve_trajectory(&hypot_path, *agent_id).unwrap();
+                        .reserve_trajectory(&hypot_path, *agent_id)
+                    {
+                        hypot_path.start_time +=1;
+                        println!("Warning Time inconsistency extending.") ;
+                                     }
                     println!("Chosen path for agent {}: {:?}", agent_id, hypot_path);
                 }
                 return;
@@ -1462,6 +1477,7 @@ fn test_reservation_system_registration() {
         positions: vec![(1, 1), (1, 0), (0, 0)],
     };
 
+    println!("===========================================================");
     let res = res_sys.reserve_trajectory(&trajectory1, 0);
     assert_eq!(res, Ok(Some(0)));
 
@@ -1471,11 +1487,15 @@ fn test_reservation_system_registration() {
     let &end_time = res_sys.unassigned_agents[0][0][0].get(&0usize).unwrap();
     assert_eq!(end_time.end_time, 3);
 
-    // Can't reserve the same trajectory twise
+    // Can't reserve the same trajectory twice
+    println!("===========================================================");
     let res = res_sys.reserve_trajectory(&trajectory1, 1);
     assert_eq!(res, Ok(None));
+    println!("Occupancy shouldnt have changed");
+
 
     // Try swapping in the same graph
+    println!("===========================================================");
     let trajectory_swap = HeterogenousTrajectory {
         graph_id: 0,
         start_time: 1,
@@ -1483,8 +1503,12 @@ fn test_reservation_system_registration() {
     };
     let res = res_sys.reserve_trajectory(&trajectory_swap, 1);
     assert_eq!(res, Ok(None));
+        println!("Occupancy shouldnt have changed");
+
 
     // Try overlapping trajectory on same graph
+        println!("===========================================================");
+
     let trajectory2 = HeterogenousTrajectory {
         graph_id: 0,
         start_time: 0,
@@ -1498,7 +1522,7 @@ fn test_reservation_system_registration() {
 #[test]
 fn test_reservation_system_registration_across_graphs() {
     let grid_bounds = vec![(4, 4), (2, 2)];
-    let mut res_sys = HeterogenousReservationSystem::new(vec![1.0, 2.0], grid_bounds, 5);
+    let mut res_sys = HeterogenousReservationSystem::new(vec![1.0, 2.0], grid_bounds.clone(), 5);
 
     let trajectory1 = HeterogenousTrajectory {
         graph_id: 0,
@@ -1516,7 +1540,6 @@ fn test_reservation_system_registration_across_graphs() {
     };
     let res = res_sys.reserve_trajectory(&trajectory2, 0);
     assert!(res.is_err());
-
     // Test swapping conflict
     let trajectory2 = HeterogenousTrajectory {
         graph_id: 1,
