@@ -750,7 +750,9 @@ impl HeterogenousReservationSystem {
                 };
                 println!("Extending {}", agent_id);
                 println!("Marking due to extension t={} p={:?}", time, (g,x,y));
-
+                if new_end_time > self.occupied.len() {
+                    continue;
+                }
                 self.occupied[time][g][x][y].insert(agent_id);
                 self.agent_to_cells[time][agent_id].push((g, x, y));
                 for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
