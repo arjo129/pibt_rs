@@ -1,0 +1,1 @@
+cargo run --example  heterogenous_visuallization '/usr/local/google/home/arjoc/ws/pypibt/assets/room-64-64-8.map' '/usr/local/google/home/arjoc/ws/pypibt/het_bench/scen.0.scen'

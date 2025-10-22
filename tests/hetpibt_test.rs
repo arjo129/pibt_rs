@@ -2,7 +2,7 @@
 use hetpibt::{HetPiBT, HeterogenousAgent};
 
 #[test]
-fn test_default_case() {
+fn test_swap_case() {
     let base_obstacles = vec![vec![false; 20]; 20];
     let graph_scale = vec![1.0, 2.0];
     let graph_bound = vec![(20, 20), (10, 10)];

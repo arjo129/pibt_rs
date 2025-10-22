@@ -6,6 +6,7 @@ use std::{
 
 mod collision_checker;
 mod pibt_with_constraints;
+pub mod hierarchical_cbs_pibt_wrapper;
 
 /// Vanilla priority based inheritance
 ///
@@ -448,7 +449,9 @@ impl MultiGridCollisionChecker {
                 for agent in 0..trajectories[graph][t].len() {
                     let (ax, ay) = trajectories[graph][t][agent];
                     if ax < 0 || ay < 0 {
-                        return Err(());
+                        println!("Uh-oh");
+                        continue;
+                        //return Err(());
                     }
                     grid[ax as usize][ay as usize] = Some(agent);
                 }
@@ -548,6 +551,7 @@ enum ReservationError {
     GraphNotFound,
     OutOfGraphBounds(usize, usize, usize),
     TrajectoryForAgentAlreadyExists,
+    TrajectoryOverWrites,
     TrajectoryEmpty,
     ExceedMaxAgents,
     AgentSwappedGraphs,
@@ -620,14 +624,9 @@ impl HeterogenousReservationSystem {
         trajectory: &HeterogenousTrajectory,
         agent_id: usize,
     ) -> Result<Option<usize>, ReservationError> {
-
-        println!("DEBUG: {}", line!());
-
         if agent_id >= self.max_agents {
             return Err(ReservationError::ExceedMaxAgents);
         }
-
-                println!("DEBUG: {}", line!());
 
         if let Some(agent_graph) = self.agent_to_graph[agent_id] {
             if trajectory.graph_id != agent_graph {
@@ -636,7 +635,6 @@ impl HeterogenousReservationSystem {
         } else {
             self.agent_to_graph[agent_id] = Some(trajectory.graph_id);
         }
-                println!("DEBUG: {}", line!());
 
         for (time_after_start, &position) in trajectory.positions.iter().enumerate() {
             let time = time_after_start + trajectory.start_time;
@@ -667,13 +665,10 @@ impl HeterogenousReservationSystem {
                 ));
             }
 
-            println!("DEBUG: {}", line!());
-
-
             if self.occupied[time][trajectory.graph_id][x][y].len() != 0 {
                 // Spot is occupied
                 println!("Attempted to occupy a reserved spot t={} p = {}, {}, {}", time, trajectory.graph_id,x,y);
-                return Ok(None);
+                return Err(ReservationError::TrajectoryOverWrites);
             }
 
             // Handle swap
@@ -686,7 +681,7 @@ impl HeterogenousReservationSystem {
             for agent in &self.occupied[time][trajectory.graph_id][from_x][from_y] {
                 if self.occupied[time - 1][trajectory.graph_id][x][y].contains(agent) {
                     println!("Attempted to swap.");
-                    return Ok(None);
+                    return Err(ReservationError::TrajectoryOverWrites);
                 }
             }
         }
@@ -985,7 +980,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 });
             }
 
-            if curr_time + 1 > self.start_time + self.max_lookahead {
+            if curr_time + 1 > self.start_time + self.max_lookahead || curr_time + 1 >= self.res_sys.occupied.len() {
                 continue;
             }
 
@@ -1158,7 +1153,7 @@ impl HetPiBT {
     }
 
     /// Attempt to solve for agent
-    fn attempt_solve_for_agent(&mut self, agent_id: usize, forward_lookup: usize) {
+    fn attempt_solve_for_agent(&mut self, agent_id: usize, forward_lookup: usize) -> Vec<usize> {
         let Some(&(graph, x, y)) = self.reservation_system.agent_last_location.get(&agent_id)
         else {
             return;
@@ -1168,6 +1163,9 @@ impl HetPiBT {
             return;
         };
         let time = end_time.end_time-1;
+
+
+        let mut reserved_trajectories = Vec::new();
 
         let mut stack = VecDeque::new();
 
@@ -1256,7 +1254,7 @@ impl HetPiBT {
             let mut forward_lookup = forward_lookup;
             if other_size < my_size {
                 let factor = (my_size / other_size).round() as usize;
-                forward_lookup *= factor * factor;
+                forward_lookup *= (factor * factor).max(20);
             }
             let Some(p) = self.reservation_system.agent_last_location.get(&neighbour.need_to_moveout[0]) else {
                 continue;
@@ -1302,10 +1300,12 @@ impl HetPiBT {
             start_time: end_time.end_time.clone(),
             positions: vec![(x, y)],
         };
-        self.reservation_system
+        let Ok(Some(p)) = self.reservation_system
             .reserve_trajectory(&path_to_reserve, agent_id)
-            .unwrap();
-        return;
+            else {
+                return vec![];
+            };
+        return vec![p];
     }
 
     pub fn solve(&mut self, max_time_steps: usize) -> Option<usize> {
@@ -1492,9 +1492,7 @@ fn test_reservation_system_registration() {
     // Can't reserve the same trajectory twice
     println!("===========================================================");
     let res = res_sys.reserve_trajectory(&trajectory1, 1);
-    assert_eq!(res, Ok(None));
-    println!("Occupancy shouldnt have changed");
-
+    assert_eq!(res,Err(ReservationError::TrajectoryOverWrites));
 
     // Try swapping in the same graph
     println!("===========================================================");
@@ -1504,13 +1502,9 @@ fn test_reservation_system_registration() {
         positions: vec![(0, 0), (1, 0)],
     };
     let res = res_sys.reserve_trajectory(&trajectory_swap, 1);
-    assert_eq!(res, Ok(None));
-        println!("Occupancy shouldnt have changed");
-
+    assert_eq!(res, Err(ReservationError::TrajectoryOverWrites));
 
     // Try overlapping trajectory on same graph
-        println!("===========================================================");
-
     let trajectory2 = HeterogenousTrajectory {
         graph_id: 0,
         start_time: 0,

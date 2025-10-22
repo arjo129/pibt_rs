@@ -111,7 +111,8 @@ impl PiBTWithConstraints {
             }
 
             if complete {
-                self.q.truncate(max_time - t);
+                println!("Solved in {}", t);
+                self.q.truncate(t);
                 return Ok(self.q.clone());
             }
         }
@@ -230,7 +231,7 @@ pub fn hierarchical_cbs_pibt(
     ends: Vec<(usize, usize)>,
     bounds: Vec<(usize, usize)>,
     grid_sizes: Vec<f32>,
-) {
+) -> Vec<Vec<Vec<(i64, i64)>>> {
     let mut agent_to_graph = vec![];
     let mut max_graph = 0;
     for &(graph, _, _) in &starts {
@@ -261,6 +262,7 @@ pub fn hierarchical_cbs_pibt(
 
     while let Some(p) = conflict_list.pop_back() {
         let mut result = vec![];
+        let mut all_solved = true;
         for g_id in 0..pibts.len() {
             let Ok(p) = pibts[g_id].solve(
                 &pibt_starts[g_id],
@@ -269,19 +271,37 @@ pub fn hierarchical_cbs_pibt(
                 &vec![],
                 &collision_checker,
             ) else {
-                panic!("Unsolvable");
+                println!("{:?}", pibt_starts);
+                println!("{:?}", pibt_ends);
+                all_solved = false;
+                continue;
             };
             result.push(p);
+        }
+
+        if !all_solved {
+            continue;
+        }
+
+        let max_len = result.iter().map(|traj| traj.len()).max().unwrap_or(0);
+
+        for traj in result.iter_mut() {
+            if let Some(last_pos) = traj.last().cloned() {
+                while traj.len() < max_len {
+                    traj.push(last_pos.clone());
+                }
+            }
         }
 
         let Ok(conflicts) = collision_checker.build_moving_obstacle_map(&result, &bounds) else {
             panic!("Some inconsistency occured");
         };
         if conflicts.len() == 0 {
-            return;
+            return result;
         }
         for conflict in conflicts {
             conflict_list.push_front(vec![conflict]);
         }
     }
+    panic!("Unsolvable");
 }

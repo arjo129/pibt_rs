@@ -4,8 +4,8 @@ use std::{
 };
 
 use hetpibt::{
-    GridClipMode, HetPiBT, HeterogenousAgent, MultiGridCollisionChecker, parse_grid,
-    parse_grid_with_scale,
+    hierarchical_cbs_pibt_wrapper::HierarchicalCbsPibtWrapper, GridClipMode, HeterogenousAgent,
+    MultiGridCollisionChecker, parse_grid, parse_grid_with_scale,
 };
 use macroquad::prelude::*;
 
@@ -119,28 +119,22 @@ async fn main() {
     println!("Reading configuration");
     let (graph_scale, graph_bounds, agents, base_obstacles) = load_grid();
     println!("Initializing solver");
-    let mut het_pibt = HetPiBT::init_solver(
+    let het_pibt = HierarchicalCbsPibtWrapper::init_solver(
         &base_obstacles,
         graph_scale.clone(),
         graph_bounds,
         agents.clone(),
     );
-    println!("Calculated individual agent cost maps");
-    let result = het_pibt.solve(5);
-    println!("Result time: {:?}", result);
+    println!("Solver finished");
+
     let mut last_update = std::time::SystemTime::now();
     let mut time = 0;
     loop {
         clear_background(BLACK);
         let p = het_pibt.get_trajectories(time);
-        if last_update.elapsed().unwrap().as_secs_f64() > 1.0 {
+        if last_update.elapsed().unwrap().as_secs_f64() > 0.5 {
             time += 1;
             last_update = std::time::SystemTime::now();
-            if let Some(max_time) = result {
-                if time > max_time {
-                    time = 0;
-                }
-            }
         }
 
         let colors = [RED, GREEN, BLUE, YELLOW, ORANGE, PURPLE, VIOLET];
