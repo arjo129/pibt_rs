@@ -402,10 +402,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                         .cloned()
                         .collect();
                     for (graph, x, y) in other_nodes {
-                        println!("Checking {:?}", (graph,x,y));
-                        println!("Unassigned {:?}", self.res_sys.unassigned_agents);
                         for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
-                            println!("Found agent {} blocking {:?} till {:?}", agent, (graph,x,y), end_time_info);
                             if end_time_info.end_time <= time {
                                 agents_to_kickout.insert(*agent);
                             }

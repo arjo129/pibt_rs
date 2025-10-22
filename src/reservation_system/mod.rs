@@ -57,9 +57,6 @@ pub(crate) struct HeterogenousReservationSystem {
 }
 
 impl HeterogenousReservationSystem {
-    pub(crate) fn debug_end_times(&self) {
-        println!("{:?}", self.agent_last_location);
-    }
     /// Create a new Heterogenous reservation system
     pub(crate) fn new(grid_sizes: Vec<f32>, grid_bounds: Vec<(usize, usize)>, max_agents: usize) -> Self {
         let collision_checker = MultiGridCollisionChecker { grid_sizes };
