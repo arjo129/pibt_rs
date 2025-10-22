@@ -196,31 +196,18 @@ impl HeterogenousReservationSystem {
             while time >= self.occupied.len() {
                 //println!("EXTENDING CAUSE TIME GAP SENSED");
                 self.extend_by_one_timestep();
-                let Some(&(g, x, y)) = self.agent_last_location.get(&agent_id) else {
-                    //println!("Could not get last location for {}", agent_id);
-                    let (x, y) = trajectory.positions[0];
-                    let g = trajectory.graph_id;
-                    //println!("Marking due to extension a={} t={} p={:?}", agent_id, time, (g,x,y));
+                if let Some(&(g, x, y)) = self.agent_last_location.get(&agent_id) {
+                    if new_end_time > self.occupied.len() {
+                        continue;
+                    }
                     self.occupied[time][g][x][y].insert(agent_id);
                     self.agent_to_cells[time][agent_id].push((g, x, y));
                     for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
+                        //println!("Marking due to collision extension t={} p={:?}", time, (g,x,y));
+
                         self.occupied[time][g][x][y].insert(agent_id);
                         self.agent_to_cells[time][agent_id].push((g, x, y));
                     }
-                    continue;
-                };
-                //println!("Extending {}", agent_id);
-                //println!("Marking due to extension a={} t={} p={:?}", agent_id, time, (g,x,y));
-                if new_end_time > self.occupied.len() {
-                    continue;
-                }
-                self.occupied[time][g][x][y].insert(agent_id);
-                self.agent_to_cells[time][agent_id].push((g, x, y));
-                for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
-                    //println!("Marking due to collision extension t={} p={:?}", time, (g,x,y));
-
-                    self.occupied[time][g][x][y].insert(agent_id);
-                    self.agent_to_cells[time][agent_id].push((g, x, y));
                 }
             }
             let (x, y) = position;
