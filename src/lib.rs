@@ -655,7 +655,7 @@ impl HetPiBT {
                     agent = *agent_id;
                     let mut hypot_path = HeterogenousTrajectory {
                         graph_id: path[0].0,
-                        start_time: path_to_reserve.start_time +1,
+                        start_time: path_to_reserve.start_time,
                         positions: path.iter().map(|&(_, x, y)| (x, y)).collect(),
                     };
                     while let Err(e) =  self
