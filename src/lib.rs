@@ -402,7 +402,10 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                         .cloned()
                         .collect();
                     for (graph, x, y) in other_nodes {
+                        println!("Checking {:?}", (graph,x,y));
+                        println!("Unassigned {:?}", self.res_sys.unassigned_agents);
                         for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
+                            println!("Found agent {} blocking {:?} till {:?}", agent, (graph,x,y), end_time_info);
                             if end_time_info.end_time <= time {
                                 agents_to_kickout.insert(*agent);
                             }
@@ -630,7 +633,6 @@ impl HetPiBT {
         {
             println!("Expanding agent {} {:?}", agent_id, neighbour);
             if neighbour.need_to_moveout.len() == 0 {
-                println!("Path is terminal");
                 let mut agent = agent_id;
                 let mut path_to_reserve = HeterogenousTrajectory {
                     graph_id: neighbour.path[0].0,
@@ -653,7 +655,7 @@ impl HetPiBT {
                     agent = *agent_id;
                     let mut hypot_path = HeterogenousTrajectory {
                         graph_id: path[0].0,
-                        start_time: path_to_reserve.start_time,
+                        start_time: path_to_reserve.start_time +1,
                         positions: path.iter().map(|&(_, x, y)| (x, y)).collect(),
                     };
                     while let Err(e) =  self
@@ -671,6 +673,9 @@ impl HetPiBT {
             let mut c = blocked_locations.clone();
             for &p in &neighbour.path {
                 c.insert(p);
+                for blocked_node in self.reservation_system.collision_checker.get_blocked_nodes(p.0, p.1, p.2) {
+                    c.insert(blocked_node);
+                }
             }
 
             if will_affect.contains_key(&neighbour.need_to_moveout[0]) || neighbour.need_to_moveout.len() > 1 {

@@ -57,6 +57,9 @@ pub(crate) struct HeterogenousReservationSystem {
 }
 
 impl HeterogenousReservationSystem {
+    pub(crate) fn debug_end_times(&self) {
+        println!("{:?}", self.agent_last_location);
+    }
     /// Create a new Heterogenous reservation system
     pub(crate) fn new(grid_sizes: Vec<f32>, grid_bounds: Vec<(usize, usize)>, max_agents: usize) -> Self {
         let collision_checker = MultiGridCollisionChecker { grid_sizes };
@@ -191,13 +194,13 @@ impl HeterogenousReservationSystem {
             let time = time_after_start + trajectory.start_time;
             ///// BUGGY CODE!!!!
             while time >= self.occupied.len() {
-                println!("EXTENDING CAUSE TIME GAP SENSED");
+                //println!("EXTENDING CAUSE TIME GAP SENSED");
                 self.extend_by_one_timestep();
                 let Some(&(g, x, y)) = self.agent_last_location.get(&agent_id) else {
-                    println!("Could not get last location for {}", agent_id);
+                    //println!("Could not get last location for {}", agent_id);
                     let (x, y) = trajectory.positions[0];
                     let g = trajectory.graph_id;
-                    println!("Marking due to extension t={} p={:?}", time, (g,x,y));
+                    //println!("Marking due to extension a={} t={} p={:?}", agent_id, time, (g,x,y));
                     self.occupied[time][g][x][y].insert(agent_id);
                     self.agent_to_cells[time][agent_id].push((g, x, y));
                     for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
@@ -206,24 +209,21 @@ impl HeterogenousReservationSystem {
                     }
                     continue;
                 };
-                println!("Extending {}", agent_id);
-                println!("Marking due to extension t={} p={:?}", time, (g,x,y));
+                //println!("Extending {}", agent_id);
+                //println!("Marking due to extension a={} t={} p={:?}", agent_id, time, (g,x,y));
                 if new_end_time > self.occupied.len() {
                     continue;
                 }
                 self.occupied[time][g][x][y].insert(agent_id);
                 self.agent_to_cells[time][agent_id].push((g, x, y));
                 for (g, x, y) in self.collision_checker.get_blocked_nodes(g, x, y) {
-                    println!("Marking due to collision extension t={} p={:?}", time, (g,x,y));
+                    //println!("Marking due to collision extension t={} p={:?}", time, (g,x,y));
 
                     self.occupied[time][g][x][y].insert(agent_id);
                     self.agent_to_cells[time][agent_id].push((g, x, y));
                 }
             }
-        println!("DEBUG: {}", line!());
-
             let (x, y) = position;
-            println!("Marking t={}, p={} {} {}", time, trajectory.graph_id, x,y);
             self.occupied[time][trajectory.graph_id][x][y].insert(agent_id);
             self.agent_to_cells[time][agent_id].push((trajectory.graph_id, x, y));
             let nodes = self
@@ -237,8 +237,6 @@ impl HeterogenousReservationSystem {
                 if y >= self.occupied[time][graph_id][x].len() {
                     continue;
                 }
-                println!("Marking due to collision t={}, p={} {} {}", time, graph_id, x,y);
-
                 self.occupied[time][graph_id][x][y].insert(agent_id);
                 self.agent_to_cells[time][agent_id].push((graph_id, x, y));
             }
@@ -309,6 +307,7 @@ impl HeterogenousReservationSystem {
         agents
             .map(|p| {
                 let Some(graph_id) = self.agent_to_graph[p] else {
+                    println!("Failed to get graph for agent");
                     return None;
                 };
                 let Some(&(_, x, y)) = self.agent_to_cells[time_step][p]
@@ -316,6 +315,7 @@ impl HeterogenousReservationSystem {
                     .filter(|&(graph, _x, _y)| *graph == graph_id)
                     .next()
                 else {
+                    //println!("Agent {} missing at timestep {}", p, time_step);
                     return None;
                 };
                 Some((graph_id, x, y))
