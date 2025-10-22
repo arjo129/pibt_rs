@@ -691,7 +691,8 @@ impl HetPiBT {
             let mut forward_lookup = forward_lookup;
             if other_size < my_size {
                 let factor = (my_size / other_size).round() as usize;
-                forward_lookup *= (factor * factor).max(20);
+                forward_lookup *= factor * factor;
+                forward_lookup = forward_lookup.max(20);
             }
             let Some(p) = self.reservation_system.agent_last_location.get(&neighbour.need_to_moveout[0]) else {
                 continue;
