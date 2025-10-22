@@ -4,8 +4,8 @@ use std::{
 };
 
 use hetpibt::{
-    hierarchical_cbs_pibt_wrapper::HierarchicalCbsPibtWrapper, GridClipMode, HeterogenousAgent,
-    MultiGridCollisionChecker, parse_grid, parse_grid_with_scale,
+    hierarchical_cbs_pibt_wrapper::HierarchicalCbsPibtWrapper, collision_checker::GridClipMode, HeterogenousAgent,
+    collision_checker::MultiGridCollisionChecker, parse_grid, parse_grid_with_scale,
 };
 use macroquad::prelude::*;
 

@@ -4,7 +4,7 @@ use std::{
 };
 
 use hetpibt::{
-    GridClipMode, HetPiBT, HeterogenousAgent, MultiGridCollisionChecker, parse_grid,
+    collision_checker::GridClipMode, HetPiBT, HeterogenousAgent, collision_checker::MultiGridCollisionChecker, parse_grid,
     parse_grid_with_scale,
 };
 use macroquad::prelude::*;
