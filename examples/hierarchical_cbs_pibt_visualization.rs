@@ -4,8 +4,8 @@ use std::{
 };
 
 use hetpibt::{
-    hierarchical_cbs_pibt_wrapper::HierarchicalCbsPibtWrapper, collision_checker::GridClipMode, HeterogenousAgent,
-    collision_checker::MultiGridCollisionChecker, parse_grid, parse_grid_with_scale,
+    HeterogenousAgent, collision_checker::MultiGridCollisionChecker,
+    hierarchical_cbs_pibt_wrapper::HierarchicalCbsPibtWrapper, parse_grid, parse_grid_with_scale,
 };
 use macroquad::prelude::*;
 
@@ -63,18 +63,8 @@ fn load_grid() -> (
             let collision_checker = MultiGridCollisionChecker {
                 grid_sizes: graph_scales.clone(),
             };
-            let start = collision_checker.get_grid_space(
-                fleet_id,
-                start_x,
-                start_y,
-                GridClipMode::ConservativeTopLeft,
-            );
-            let end = collision_checker.get_grid_space(
-                fleet_id,
-                goal_x,
-                goal_y,
-                GridClipMode::ConservativeTopLeft,
-            );
+            let start = collision_checker.get_grid_space(fleet_id, start_x, start_y);
+            let end = collision_checker.get_grid_space(fleet_id, goal_x, goal_y);
             agents.push(HeterogenousAgent {
                 graph_id: fleet_id,
                 start,

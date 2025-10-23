@@ -1,1 +1,8 @@
 cargo run --example  heterogenous_visuallization '/usr/local/google/home/arjoc/ws/pypibt/assets/room-64-64-8.map' '/usr/local/google/home/arjoc/ws/pypibt/het_bench/scen.0.scen'
+
+Figured out why asking for space is not sufficient. Who is asking makes a big
+deal of difference. For instance if a big robot requires a smaller robot to ask
+for space, then the small robot should clear all space for it.
+
+But if a small robot is blocking a bigger space, then the robots should try to
+make do with the smallest common tile-size for planning.

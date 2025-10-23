@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, ops::Mul};
 
-use crate::{conflicts::ConflictTreeNode, MultiGridCollisionChecker, collision_checker};
+use crate::{MultiGridCollisionChecker, collision_checker, conflicts::ConflictTreeNode};
 
 /// Vanilla priority based inheritance
 ///

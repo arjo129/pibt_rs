@@ -2,13 +2,6 @@ use std::rc::Rc;
 
 use crate::conflicts::{ConflictTreeNode, ConflictType};
 
-/// When converting between coordinate space, a grid clip mode
-/// is in charge of figuring out how to handle rounding.
-pub enum GridClipMode {
-    ConservativeTopLeft,
-    ConservativeBottomRight,
-}
-
 /// Internal collision checking structure for mapping between grid cells
 pub struct MultiGridCollisionChecker {
     /// The size of an individual grid.
@@ -18,7 +11,12 @@ pub struct MultiGridCollisionChecker {
 
 impl MultiGridCollisionChecker {
     /// Gets the other blocked node
-    pub fn get_blocked_nodes(&self, grid_id: usize, x: usize, y: usize) -> Vec<(usize, usize, usize)> {
+    pub fn get_blocked_nodes(
+        &self,
+        grid_id: usize,
+        x: usize,
+        y: usize,
+    ) -> Vec<(usize, usize, usize)> {
         // Get the absolute x,y position in grid space
         let target_size = self.grid_sizes[grid_id];
         let (real_world_x, real_world_y) = (x as f32 * target_size, y as f32 * target_size);
@@ -31,11 +29,9 @@ impl MultiGridCollisionChecker {
             }
             let (tl_x, tl_y) = (real_world_x, real_world_y);
             let (br_x, br_y) = (real_world_x + target_size, real_world_y + target_size);
-            let (start_x, start_y) =
-                self.get_grid_space(id, tl_x, tl_y, GridClipMode::ConservativeTopLeft);
+            let (start_x, start_y) = self.get_grid_space(id, tl_x, tl_y);
 
-            let (end_x, end_y) =
-                self.get_grid_space(id, br_x, br_y, GridClipMode::ConservativeBottomRight);
+            let (end_x, end_y) = self.get_grid_space(id, br_x, br_y);
 
             for dx in start_x..end_x {
                 for dy in start_y..end_y {
@@ -47,26 +43,13 @@ impl MultiGridCollisionChecker {
     }
 
     // Takes in an (x,y) coordinate and returns the grid occupying it currently.
-    pub fn get_grid_space(
-        &self,
-        grid_id: usize,
-        x: f32,
-        y: f32,
-        mode: GridClipMode,
-    ) -> (usize, usize) {
+    pub fn get_grid_space(&self, grid_id: usize, x: f32, y: f32) -> (usize, usize) {
         let coords = (
             (x / self.grid_sizes[grid_id]),
             (y / self.grid_sizes[grid_id]),
         );
 
-        match mode {
-            GridClipMode::ConservativeTopLeft => {
-                (coords.0.floor() as usize, coords.1.floor() as usize)
-            }
-            GridClipMode::ConservativeBottomRight => {
-                (coords.0.ceil() as usize, coords.1.ceil() as usize)
-            }
-        }
+        (coords.0.floor() as usize, coords.1.floor() as usize)
     }
 
     pub fn build_moving_obstacle_map(

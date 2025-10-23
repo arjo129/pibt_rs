@@ -5,10 +5,10 @@ use std::{
 };
 
 pub mod collision_checker;
-pub mod pibt_with_constraints;
-pub mod hierarchical_cbs_pibt_wrapper;
-pub mod reservation_system;
 pub mod conflicts;
+pub mod hierarchical_cbs_pibt_wrapper;
+pub mod pibt_with_constraints;
+pub mod reservation_system;
 
 /// Vanilla priority based inheritance
 ///
@@ -416,7 +416,9 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 });
             }
 
-            if curr_time + 1 > self.start_time + self.max_lookahead || curr_time + 1 >= self.res_sys.occupied.len() {
+            if curr_time + 1 > self.start_time + self.max_lookahead
+                || curr_time + 1 >= self.res_sys.occupied.len()
+            {
                 continue;
             }
 
@@ -437,7 +439,10 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 })
                 .filter(|&(x, y)| {
                     self.res_sys.occupied.len() >= (curr_time + 1)
-                        || self.res_sys.occupied[curr_time + 1][parent_graph][x][y].len() == 0
+                        || (self.res_sys.occupied[curr_time + 1][parent_graph][x][y].len() == 0
+                            && !self
+                                .dont_occupy
+                                .contains(&(parent_graph, x, y)))
                 }) // Dynamic obstacles
                 .filter(|&(x, y)| {
                     for agent in &self.res_sys.occupied[curr_time][parent_graph][x][y] {
@@ -598,7 +603,7 @@ impl HetPiBT {
         else {
             return vec![];
         };
-        let time = end_time.end_time-1;
+        let time = end_time.end_time;
 
         let mut stack = VecDeque::new();
 
@@ -618,7 +623,7 @@ impl HetPiBT {
                 continue;
             }
 
-            println!("Starting agent at {:?}", (graph,x,y));
+            println!("Starting agent at {:?}", (graph, x, y));
             println!("Pushing path  {:?} for agent {}", path, agent_id);
             // Hack even though it DFS, we want the earliest node to be expanded to
             // be the first one generated.
@@ -642,10 +647,11 @@ impl HetPiBT {
 
                 while let Err(e) = self
                     .reservation_system
-                    .reserve_trajectory(&path_to_reserve, agent) {
-                        println!("Delaying");
-                        path_to_reserve.start_time +=1;
-                    }
+                    .reserve_trajectory(&path_to_reserve, agent)
+                {
+                    println!("Delaying");
+                    path_to_reserve.start_time += 1;
+                }
 
                 // Cascade the delays back up the chain
                 while let Some((agent_id, path)) = will_affect.get(&agent) {
@@ -655,12 +661,12 @@ impl HetPiBT {
                         start_time: path_to_reserve.start_time,
                         positions: path.iter().map(|&(_, x, y)| (x, y)).collect(),
                     };
-                    while let Err(e) =  self
+                    while let Err(e) = self
                         .reservation_system
                         .reserve_trajectory(&hypot_path, *agent_id)
                     {
-                        hypot_path.start_time +=1;
-                                     }
+                        hypot_path.start_time += 1;
+                    }
                     println!("Chosen path for agent {}: {:?}", agent_id, hypot_path);
                 }
                 return vec![];
@@ -670,12 +676,18 @@ impl HetPiBT {
             let mut c = blocked_locations.clone();
             for &p in &neighbour.path {
                 c.insert(p);
-                for blocked_node in self.reservation_system.collision_checker.get_blocked_nodes(p.0, p.1, p.2) {
+                for blocked_node in self
+                    .reservation_system
+                    .collision_checker
+                    .get_blocked_nodes(p.0, p.1, p.2)
+                {
                     c.insert(blocked_node);
                 }
             }
 
-            if will_affect.contains_key(&neighbour.need_to_moveout[0]) || neighbour.need_to_moveout.len() > 1 {
+            if will_affect.contains_key(&neighbour.need_to_moveout[0])
+                || neighbour.need_to_moveout.len() > 1
+            {
                 // Deadlock. Do not proceed
                 println!("Deadlock");
                 continue;
@@ -689,13 +701,19 @@ impl HetPiBT {
             if other_size < my_size {
                 let factor = (my_size / other_size).round() as usize;
                 forward_lookup *= factor * factor;
-                forward_lookup = forward_lookup.max(20);
+                forward_lookup = forward_lookup.max(5);
             }
-            let Some(p) = self.reservation_system.agent_last_location.get(&neighbour.need_to_moveout[0]) else {
+            let Some(p) = self
+                .reservation_system
+                .agent_last_location
+                .get(&neighbour.need_to_moveout[0])
+            else {
                 continue;
             };
 
-             let Some(end_time) = self.reservation_system.unassigned_agents[p.0][p.1][p.2].get(&neighbour.need_to_moveout[0]) else {
+            let Some(end_time) = self.reservation_system.unassigned_agents[p.0][p.1][p.2]
+                .get(&neighbour.need_to_moveout[0])
+            else {
                 continue;
             };
 
@@ -707,7 +725,7 @@ impl HetPiBT {
                 &self.cost_map,
                 *p,
                 &c,
-                end_time.end_time - 1,
+                end_time.end_time,
                 forward_lookup,
                 neighbour.need_to_moveout[0],
             );
@@ -720,7 +738,10 @@ impl HetPiBT {
                     neighbour.need_to_moveout[0],
                     (agent_id, neighbour.path.clone()),
                 );
-                println!("Adding path for {} {:?}", neighbour.need_to_moveout[0], path);
+                println!(
+                    "Adding path for {} {:?}",
+                    neighbour.need_to_moveout[0], path
+                );
                 stack.push_front((
                     neighbour.need_to_moveout[0],
                     c.clone(),
@@ -735,11 +756,12 @@ impl HetPiBT {
             start_time: end_time.end_time.clone(),
             positions: vec![(x, y)],
         };
-        let Ok(Some(p)) = self.reservation_system
+        let Ok(Some(p)) = self
+            .reservation_system
             .reserve_trajectory(&path_to_reserve, agent_id)
-            else {
-                return vec![];
-            };
+        else {
+            return vec![];
+        };
         return vec![p];
     }
 
@@ -779,7 +801,7 @@ impl HetPiBT {
                     .get_agent_last_alloc_time(a)
                     .unwrap();
 
-                if agent.end_time <= step {
+                //if agent.end_time <= step {
                     checked = true;
                     let cost = self.cost_map[a][agent.x][agent.y];
                     println!("cost at current step {}", cost);
@@ -800,7 +822,7 @@ impl HetPiBT {
                         x.0 += 1.0;
                         flg_fin = false;
                     }
-                }
+                //}
             }
             if !checked {
                 continue;
@@ -901,4 +923,3 @@ fn test_best_first_search() {
     assert_eq!(paths[0].need_to_moveout, [0]);
     assert_eq!(paths[1].need_to_moveout, []);
 }
-

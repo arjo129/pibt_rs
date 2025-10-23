@@ -1,4 +1,3 @@
-
 use hetpibt::{HetPiBT, HeterogenousAgent};
 
 #[test]
@@ -58,6 +57,6 @@ fn test_default_case() {
         graph_bound,
         agents.clone(),
     );
-    let result = het_pibt.solve(10);
+    let result = het_pibt.solve(5);
     assert!(result.is_some());
 }

@@ -4,7 +4,7 @@ use std::{
 };
 
 use hetpibt::{
-    collision_checker::GridClipMode, HetPiBT, HeterogenousAgent, collision_checker::MultiGridCollisionChecker, parse_grid,
+    HetPiBT, HeterogenousAgent, collision_checker::MultiGridCollisionChecker, parse_grid,
     parse_grid_with_scale,
 };
 use macroquad::prelude::*;
@@ -63,18 +63,8 @@ fn load_grid() -> (
             let collision_checker = MultiGridCollisionChecker {
                 grid_sizes: graph_scales.clone(),
             };
-            let start = collision_checker.get_grid_space(
-                fleet_id,
-                start_x,
-                start_y,
-                GridClipMode::ConservativeTopLeft,
-            );
-            let end = collision_checker.get_grid_space(
-                fleet_id,
-                goal_x,
-                goal_y,
-                GridClipMode::ConservativeTopLeft,
-            );
+            let start = collision_checker.get_grid_space(fleet_id, start_x, start_y);
+            let end = collision_checker.get_grid_space(fleet_id, goal_x, goal_y);
             agents.push(HeterogenousAgent {
                 graph_id: fleet_id,
                 start,
@@ -125,15 +115,16 @@ async fn main() {
         graph_bounds,
         agents.clone(),
     );
+    let steps = 800;
     println!("Calculated individual agent cost maps");
-    let result = het_pibt.solve(10);
+    let result = het_pibt.solve(steps);
     println!("Result time: {:?}", result);
     let mut last_update = std::time::SystemTime::now();
     let mut time = 0;
     loop {
         clear_background(BLACK);
         let p = het_pibt.get_trajectories(time);
-        if last_update.elapsed().unwrap().as_secs_f64() > 1.0 {
+        if last_update.elapsed().unwrap().as_secs_f64() > 0.1 {
             time += 1;
             last_update = std::time::SystemTime::now();
             if let Some(max_time) = result {
@@ -147,7 +138,7 @@ async fn main() {
         for (agent, px) in p.iter().enumerate() {
             if let Some((g, x, y)) = px {
                 let g_scale = graph_scale[*g];
-                let h_scale = 20.0;
+                let h_scale = 1.0;
                 let x = *x as f32;
                 let y = *y as f32;
                 let x = x * g_scale * h_scale + g_scale * h_scale / 2.0;

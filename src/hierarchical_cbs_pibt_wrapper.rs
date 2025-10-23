@@ -1,6 +1,5 @@
-
-use crate::pibt_with_constraints::hierarchical_cbs_pibt;
 use crate::HeterogenousAgent;
+use crate::pibt_with_constraints::hierarchical_cbs_pibt;
 
 pub struct HierarchicalCbsPibtWrapper {
     pub trajectories: Vec<Vec<Vec<(i64, i64)>>>,
@@ -22,11 +21,11 @@ impl HierarchicalCbsPibtWrapper {
 
         let trajectories = hierarchical_cbs_pibt(starts, ends, grid_bounds, graph_scale);
 
-        let mut agent_to_graph = vec![(0,0); agents.len()];
+        let mut agent_to_graph = vec![(0, 0); agents.len()];
         let mut agent_in_graph_count = vec![0; 5];
         for (agent_id, agent) in agents.iter().enumerate() {
             agent_to_graph[agent_id] = (agent.graph_id, agent_in_graph_count[agent.graph_id]);
-            agent_in_graph_count[agent.graph_id] +=1;
+            agent_in_graph_count[agent.graph_id] += 1;
         }
 
         Self {
