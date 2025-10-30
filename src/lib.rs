@@ -313,7 +313,7 @@ use crate::collision_checker::MultiGridCollisionChecker;
 
 use crate::reservation_system::{HeterogenousReservationSystem, HeterogenousTrajectory};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProposedPath {
     path: Vec<(usize, usize, usize)>,
     need_to_moveout: Vec<usize>,
@@ -331,6 +331,7 @@ struct BestFirstSearchInstance<'a, 'b, 'c> {
     pq: BinaryHeap<Reverse<(usize, usize, (usize, usize, usize))>>,
     came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
     agent: usize,
+    //force_kickout: bool
 }
 
 impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
@@ -368,7 +369,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
             if !self
                 .dont_occupy
                 .contains(&(parent_graph, parent_x, parent_y))
-                || self.distance_grid[self.agent][parent_x][parent_y] == 0
+                || false//self.distance_grid[self.agent][parent_x][parent_y] == 0
                 || (self.curr_loc == (parent_graph, parent_x, parent_y)
                     && curr_time != self.start_time)
             {
@@ -426,6 +427,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 .iter()
                 .map(|(dx, dy)| (parent_x as i64 + dx, parent_y as i64 + dy))
                 .filter(|&(x, y)| {
+                    // Bounds check
                     x >= 0
                         && y >= 0
                         && x < (self.distance_grid[self.agent].len() as i64)
@@ -434,17 +436,36 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 .map(|(x, y)| (x as usize, y as usize))
                 .filter(|&(x, y)| self.distance_grid[self.agent][x][y] >= 0) // Static obstacles
                 .filter(|&(x, y)| {
+                    //bounds
                     self.res_sys.occupied[curr_time + 1][parent_graph].len() > x
                         && self.res_sys.occupied[curr_time + 1][parent_graph][x].len() > y
                 })
                 .filter(|&(x, y)| {
                     self.res_sys.occupied.len() >= (curr_time + 1)
                         || (self.res_sys.occupied[curr_time + 1][parent_graph][x][y].len() == 0
-                            && !self
-                                .dont_occupy
-                                .contains(&(parent_graph, x, y)))
+                            && !self.dont_occupy.contains(&(parent_graph, x, y)))
                 }) // Dynamic obstacles
+                /* .filter(|&(x, y)| {
+                    for (agent, _end_time) in &self.res_sys.unassigned_agents[parent_graph][x][y] {
+                        if self.distance_grid[*agent][x][y] == 0 {
+                            return false;
+                        }
+                    }
+                    for (g, x, y) in
+                        self.res_sys
+                            .collision_checker
+                            .get_blocked_nodes(parent_graph, x, y)
+                    {
+                        for (agent, _end_time) in &self.res_sys.unassigned_agents[g][x][y] {
+                            if self.distance_grid[*agent][x][y] == 0 {
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                }) // Handle agents at end location*/
                 .filter(|&(x, y)| {
+                    // swap
                     for agent in &self.res_sys.occupied[curr_time][parent_graph][x][y] {
                         if self.res_sys.occupied[curr_time + 1][parent_graph][p.2.1][p.2.2]
                             .contains(agent)
@@ -456,7 +477,8 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 });
 
             for (x, y) in neighbors {
-                let tentative_g_score = curr_time + self.distance_grid[self.agent][x][y] as usize;
+                let tentative_g_score =
+                    curr_time + self.distance_grid[self.agent][x][y].max(0) as usize;
                 if self
                     .came_from
                     .contains_key(&(curr_time + 1, parent_graph, x, y))
@@ -654,8 +676,12 @@ impl HetPiBT {
                 }
 
                 // Cascade the delays back up the chain
+                println!("will_affect: {:?}", will_affect);
+                //panic!("");
                 while let Some((agent_id, path)) = will_affect.get(&agent) {
                     agent = *agent_id;
+
+                    //panic!("");
                     let mut hypot_path = HeterogenousTrajectory {
                         graph_id: path[0].0,
                         start_time: path_to_reserve.start_time,
@@ -730,7 +756,14 @@ impl HetPiBT {
                 neighbour.need_to_moveout[0],
             );
             for path in search {
+                println!("{:?}", path);
                 if path.need_to_moveout.len() > 1 {
+                    continue;
+                }
+
+                if will_affect.contains_key(&neighbour.need_to_moveout[0])
+                {
+                    //Deadlock
                     continue;
                 }
 
@@ -772,10 +805,15 @@ impl HetPiBT {
                 else {
                     panic!("Solver was not properly initiallized");
                 };
+                if self.cost_map[p][x][y] != 0{
                 Some((
                     (self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32,
                     p,
                 ))
+                }
+                else {
+                    Some((100000.0,p))
+                }
             })
             .collect();
 
@@ -794,6 +832,8 @@ impl HetPiBT {
             let mut flg_fin = true;
             let mut checked = false;
             println!("===========================================");
+            println!("Step {:?}", step);
+
             self.reservation_system.extend_by_one_timestep();
             for a in agents {
                 let agent = self
@@ -802,26 +842,26 @@ impl HetPiBT {
                     .unwrap();
 
                 //if agent.end_time <= step {
-                    checked = true;
-                    let cost = self.cost_map[a][agent.x][agent.y];
-                    println!("cost at current step {}", cost);
-                    let Some(&idx) = last_prio.get(&a) else {
-                        panic!("Could not find ");
-                    };
-                    let Some(x) = agent_priorities[idx].as_mut() else {
-                        panic!("Failed to calculate cost");
-                    };
+                checked = true;
+                let cost = self.cost_map[a][agent.x][agent.y];
+                println!("cost at current step {}", cost);
+                let Some(&idx) = last_prio.get(&a) else {
+                    panic!("Could not find ");
+                };
+                let Some(x) = agent_priorities[idx].as_mut() else {
+                    panic!("Failed to calculate cost");
+                };
 
-                    // For debugging
-                    assert!(x.1 == a);
+                // For debugging
+                assert!(x.1 == a);
 
-                    println!("Priority at current step {:?} for {}", x, a);
-                    if cost == 0 {
-                        x.0 -= x.0.floor();
-                    } else {
-                        x.0 += 1.0;
-                        flg_fin = false;
-                    }
+                println!("Priority at current step {:?} for {}", x, a);
+                if cost == 0 {
+                    x.0 = 10000000.00;
+                } else {
+                    x.0 += 1.0;
+                    flg_fin = false;
+                }
                 //}
             }
             if !checked {
@@ -913,13 +953,11 @@ fn test_best_first_search() {
     );
     let paths: Vec<_> = search.collect();
     println!("{:?}", paths);
-    assert_eq!(paths.len(), 3);
+    assert_eq!(paths.len(), 2);
     // Best case we try to move near the goal forcing the blocking agent out
     assert_eq!(paths[0].path, vec![(1, 0, 0), (1, 0, 1)]);
-    // Second best case is we stay put
-    assert_eq!(paths[1].path, vec![(1, 0, 0), (1, 0, 0)]);
-    // We could oscillate out of the way but it is much less desireable
-    assert_eq!(paths[2].path, vec![(1, 0, 0), (1, 1, 0)]);
+    assert_eq!(paths[2].path, vec![(1, 0, 0), (1, 0, 0)]);
+    assert_eq!(paths[1].path, vec![(1, 0, 0), (1, 1, 0)]);
     assert_eq!(paths[0].need_to_moveout, [0]);
     assert_eq!(paths[1].need_to_moveout, []);
 }
