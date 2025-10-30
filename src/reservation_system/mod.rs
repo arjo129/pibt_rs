@@ -418,6 +418,31 @@ fn test_reservation_system_registration() {
 
 #[cfg(test)]
 #[test]
+fn test_delay_behaviour() {
+    let grid_bounds = vec![(4, 4), (2, 2)];
+    let mut res_sys = HeterogenousReservationSystem::new(vec![1.0, 2.0], grid_bounds, 5);
+    let initial_location1 = HeterogenousTrajectory {
+        graph_id: 0,
+        start_time: 0,
+        positions: vec![(0,3)]
+    };
+    let initial_location2 = HeterogenousTrajectory {
+        graph_id: 1,
+        start_time: 0,
+        positions: vec![(0,0)]
+    };
+    res_sys.reserve_trajectory(&initial_location1, 0);
+    res_sys.reserve_trajectory(&initial_location2, 1);
+
+    /*res_sys.reserve_trajectory(&HeterogenousTrajectory {
+        graph_id: 0,
+        start_time: 0,
+        positions: vec![(0,3), (0,3)]
+    }, 0);*/
+}
+
+#[cfg(test)]
+#[test]
 fn test_reservation_system_registration_across_graphs() {
     let grid_bounds = vec![(4, 4), (2, 2)];
     let mut res_sys = HeterogenousReservationSystem::new(vec![1.0, 2.0], grid_bounds.clone(), 5);

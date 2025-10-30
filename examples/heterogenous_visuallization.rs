@@ -95,12 +95,24 @@ fn load_grid() -> (
             start: (0, 3),
             end: (0, 7),
         },
-        /*HeterogenousAgent {
+        HeterogenousAgent {
             graph_id: 1,
             start: (0, 0),
             end: (0, 1),
-        },*/
+        }
     ];
+    /*let agents = vec![
+        HeterogenousAgent {
+            graph_id: 0,
+            start: (0, 2),
+            end: (0, 5),
+        },
+        HeterogenousAgent {
+            graph_id: 0,
+            start: (0, 3),
+            end: (0, 0),
+        },
+    ];*/
     (graph_scale, graph_bound, agents, base_obstacles)
 }
 
@@ -115,7 +127,7 @@ async fn main() {
         graph_bounds,
         agents.clone(),
     );
-    let steps = 25;
+    let steps = 10;
     println!("Calculated individual agent cost maps");
     let result = het_pibt.solve(steps);
     println!("Result time: {:?}", result);

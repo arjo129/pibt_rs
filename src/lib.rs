@@ -313,7 +313,7 @@ use crate::collision_checker::MultiGridCollisionChecker;
 
 use crate::reservation_system::{HeterogenousReservationSystem, HeterogenousTrajectory};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct ProposedPath {
     path: Vec<(usize, usize, usize)>,
     need_to_moveout: Vec<usize>,
@@ -369,9 +369,9 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
             if !self
                 .dont_occupy
                 .contains(&(parent_graph, parent_x, parent_y))
-                || false//self.distance_grid[self.agent][parent_x][parent_y] == 0
+                //|| self.distance_grid[self.agent][parent_x][parent_y] == 0
                 || (self.curr_loc == (parent_graph, parent_x, parent_y)
-                    && curr_time != self.start_time)
+                    && curr_time > self.start_time + self.max_lookahead)
             {
                 // Backtrack
                 let mut node = (curr_time, parent_graph, parent_x, parent_y);
@@ -465,7 +465,6 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                     return true;
                 }) // Handle agents at end location*/
                 .filter(|&(x, y)| {
-                    // swap
                     for agent in &self.res_sys.occupied[curr_time][parent_graph][x][y] {
                         if self.res_sys.occupied[curr_time + 1][parent_graph][p.2.1][p.2.2]
                             .contains(agent)
@@ -478,7 +477,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
 
             for (x, y) in neighbors {
                 let tentative_g_score =
-                    curr_time + self.distance_grid[self.agent][x][y].max(0) as usize;
+                    self.distance_grid[self.agent][x][y].max(0) as usize;
                 if self
                     .came_from
                     .contains_key(&(curr_time + 1, parent_graph, x, y))
@@ -639,7 +638,7 @@ impl HetPiBT {
             forward_lookup,
             agent_id,
         );
-        let mut will_affect: HashMap<usize, (usize, Vec<(usize, usize, usize)>)> = HashMap::new();
+        let mut will_affect: HashMap<(usize, ProposedPath), (usize, ProposedPath)> = HashMap::new();
         for path in search {
             if path.need_to_moveout.len() > 1 {
                 continue;
@@ -671,29 +670,32 @@ impl HetPiBT {
                     .reservation_system
                     .reserve_trajectory(&path_to_reserve, agent)
                 {
-                    println!("Delaying");
+                    println!("Delaying {:?}", e);
                     path_to_reserve.start_time += 1;
                 }
 
                 // Cascade the delays back up the chain
                 println!("will_affect: {:?}", will_affect);
+                let mut path_to_study = neighbour.clone();
                 //panic!("");
-                while let Some((agent_id, path)) = will_affect.get(&agent) {
+                while let Some((agent_id, path)) = will_affect.get(&(agent, path_to_study)) {
                     agent = *agent_id;
-
+                    println!("Setting {:?} {:?}", agent, path);
+                    path_to_study = path.clone();
                     //panic!("");
                     let mut hypot_path = HeterogenousTrajectory {
-                        graph_id: path[0].0,
-                        start_time: path_to_reserve.start_time,
-                        positions: path.iter().map(|&(_, x, y)| (x, y)).collect(),
+                        graph_id: path.path[0].0,
+                        start_time: path_to_reserve.start_time + 1,
+                        positions: path.path.iter().map(|&(_, x, y)| (x, y)).collect(),
                     };
                     while let Err(e) = self
                         .reservation_system
-                        .reserve_trajectory(&hypot_path, *agent_id)
+                        .reserve_trajectory(&hypot_path, agent)
                     {
+                        println!("Delaying {:?}", e);
                         hypot_path.start_time += 1;
                     }
-                    println!("Chosen path for agent {}: {:?}", agent_id, hypot_path);
+                    println!("Chosen path for agent {}: {:?}", path.need_to_moveout[0], hypot_path);
                 }
                 return vec![];
             }
@@ -711,7 +713,7 @@ impl HetPiBT {
                 }
             }
 
-            if will_affect.contains_key(&neighbour.need_to_moveout[0])
+            if will_affect.contains_key(&(agent_id, neighbour.clone()))
                 || neighbour.need_to_moveout.len() > 1
             {
                 // Deadlock. Do not proceed
@@ -727,7 +729,8 @@ impl HetPiBT {
             if other_size < my_size {
                 let factor = (my_size / other_size).round() as usize;
                 forward_lookup *= factor * factor;
-                forward_lookup = forward_lookup.max(5);
+                println!("Forward lookup {:?}", forward_lookup);
+                forward_lookup = forward_lookup.max(15);
             }
             let Some(p) = self
                 .reservation_system
@@ -743,7 +746,6 @@ impl HetPiBT {
                 continue;
             };
 
-            c.insert(*p);
             println!("pos: {:?} {:?} {}", p, c, forward_lookup);
             // Try to get the robot to move out
             let search = BestFirstSearchInstance::create_search_instance(
@@ -755,21 +757,23 @@ impl HetPiBT {
                 forward_lookup,
                 neighbour.need_to_moveout[0],
             );
-            for path in search {
+            let mut v: Vec<_> = search.collect();
+            v.reverse();
+            for path in v {
                 println!("{:?}", path);
                 if path.need_to_moveout.len() > 1 {
                     continue;
                 }
 
-                if will_affect.contains_key(&neighbour.need_to_moveout[0])
+                if will_affect.contains_key(&(agent_id,neighbour.clone()))
                 {
                     //Deadlock
                     continue;
                 }
 
                 will_affect.insert(
-                    neighbour.need_to_moveout[0],
-                    (agent_id, neighbour.path.clone()),
+                    (neighbour.need_to_moveout[0], path.clone()),
+                    (agent_id, neighbour.clone()),
                 );
                 println!(
                     "Adding path for {} {:?}",
@@ -807,7 +811,7 @@ impl HetPiBT {
                 };
                 if self.cost_map[p][x][y] != 0{
                 Some((
-                    (self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32,
+                    (self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32 + rand::random::<f32>(),
                     p,
                 ))
                 }
