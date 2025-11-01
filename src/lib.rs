@@ -328,7 +328,7 @@ struct BestFirstSearchInstance<'a, 'b, 'c> {
     distance_grid: &'b Vec<Vec<Vec<i64>>>,
     max_lookahead: usize,
     res_sys: &'a HeterogenousReservationSystem,
-    pq: BinaryHeap<Reverse<(usize, usize, (usize, usize, usize))>>,
+    pq: BinaryHeap<Reverse<(usize, usize, usize, (usize, usize, usize))>>,
     came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
     agent: usize,
     //force_kickout: bool
@@ -345,7 +345,7 @@ impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
         agent: usize,
     ) -> Self {
         let mut pq = BinaryHeap::new();
-        pq.push(Reverse((0, start_time, curr_loc.clone())));
+        pq.push(Reverse((0,0, start_time, curr_loc.clone())));
         BestFirstSearchInstance {
             curr_loc,
             start_time,
@@ -358,31 +358,9 @@ impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
             agent,
         }
     }
-}
 
-impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
-    type Item = ProposedPath;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(Reverse(p)) = self.pq.pop() {
-            let (score, curr_time, (parent_graph, parent_x, parent_y)) = p;
-            if !self
-                .dont_occupy
-                .contains(&(parent_graph, parent_x, parent_y))
-                //|| self.distance_grid[self.agent][parent_x][parent_y] == 0
-                || (self.curr_loc == (parent_graph, parent_x, parent_y)
-                    && curr_time > self.start_time + self.max_lookahead)
-            {
-                // Backtrack
-                let mut node = (curr_time, parent_graph, parent_x, parent_y);
-                let mut v = vec![node.clone()];
-                while let Some(p) = self.came_from.get(&node) {
-                    v.push(p.clone());
-                    node = *p;
-                }
-                v.reverse();
-
-                let mut agents_to_kickout = HashSet::new();
+    fn evaluate_agents_to_kickout(&self, v: &Vec<(usize,usize,usize,usize)>) -> HashSet<usize> {
+        let mut agents_to_kickout = HashSet::new();
                 for &(time, graph, x, y) in v.iter() {
                     let time = self.start_time + time;
                     for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
@@ -410,6 +388,37 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                         }
                     }
                 }
+                agents_to_kickout
+    }
+}
+
+impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
+    type Item = ProposedPath;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(Reverse(p)) = self.pq.pop() {
+            let (conf, score, curr_time, (parent_graph, parent_x, parent_y)) = p;
+            
+            if !self
+                .dont_occupy
+                .contains(&(parent_graph, parent_x, parent_y))
+                ||(!self
+                .dont_occupy
+                .contains(&(parent_graph, parent_x, parent_y)) && self.distance_grid[self.agent][parent_x][parent_y] == 0)
+                || (self.curr_loc == (parent_graph, parent_x, parent_y)
+                    && curr_time > self.start_time + self.max_lookahead)
+            {
+                println!("Returning {} {}", conf, score);
+                // Backtrack
+                let mut node = (curr_time, parent_graph, parent_x, parent_y);
+                let mut v = vec![node.clone()];
+                while let Some(p) = self.came_from.get(&node) {
+                    v.push(p.clone());
+                    node = *p;
+                }
+                v.reverse();
+
+                let agents_to_kickout = self.evaluate_agents_to_kickout(&v);
 
                 return Some(ProposedPath {
                     path: v.iter().map(|&(_, graph, x, y)| (graph, x, y)).collect(),
@@ -466,7 +475,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 }) // Handle agents at end location*/
                 .filter(|&(x, y)| {
                     for agent in &self.res_sys.occupied[curr_time][parent_graph][x][y] {
-                        if self.res_sys.occupied[curr_time + 1][parent_graph][p.2.1][p.2.2]
+                        if self.res_sys.occupied[curr_time + 1][parent_graph][p.3.1][p.3.2]
                             .contains(agent)
                         {
                             return false;
@@ -478,21 +487,35 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
             for (x, y) in neighbors {
                 let tentative_g_score =
                     self.distance_grid[self.agent][x][y].max(0) as usize;
+
+                // Backtrack
                 if self
                     .came_from
                     .contains_key(&(curr_time + 1, parent_graph, x, y))
                 {
                     continue;
                 }
+         
+                self.came_from.insert(
+                    (curr_time + 1, parent_graph, x, y),
+                    (curr_time, parent_graph, p.3.1, p.3.2),
+                );
+                 let mut node = (curr_time, parent_graph, x, y);
+                let mut v = vec![node.clone()];
+                while let Some(p) = self.came_from.get(&node) {
+                    v.push(p.clone());
+                    node = *p;
+                }
+                v.reverse();
+
+                let agents_to_kickout = self.evaluate_agents_to_kickout(&v);
+
                 self.pq.push(Reverse((
                     tentative_g_score,
+                    agents_to_kickout.len(),
                     curr_time + 1,
                     (parent_graph, x, y),
                 )));
-                self.came_from.insert(
-                    (curr_time + 1, parent_graph, x, y),
-                    (curr_time, parent_graph, p.2.1, p.2.2),
-                );
             }
         }
         return None;
@@ -662,6 +685,7 @@ impl HetPiBT {
                     start_time: end_time.end_time.clone(),
                     positions: neighbour.path.iter().map(|&(_, x, y)| (x, y)).collect(),
                 };
+
                 println!("Agent {}", agent);
                 println!("{:?}", path_to_reserve);
                 println!("First path for agent {}: {:?}", agent_id, path_to_reserve);
@@ -758,7 +782,7 @@ impl HetPiBT {
                 neighbour.need_to_moveout[0],
             );
             let mut v: Vec<_> = search.collect();
-            v.reverse();
+            //v.reverse();
             for path in v {
                 println!("{:?}", path);
                 if path.need_to_moveout.len() > 1 {
@@ -811,7 +835,7 @@ impl HetPiBT {
                 };
                 if self.cost_map[p][x][y] != 0{
                 Some((
-                    (self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32 + rand::random::<f32>(),
+                    (self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32 /*+ rand::random::<f32>()*0.1*/,
                     p,
                 ))
                 }
@@ -861,9 +885,9 @@ impl HetPiBT {
 
                 println!("Priority at current step {:?} for {}", x, a);
                 if cost == 0 {
-                    x.0 = 10000000.00;
+                    x.0 = 0.00;
                 } else {
-                    x.0 += 1.0;
+                    x.0 += 1.0 /*+ rand::random::<f32>()*0.1*/;
                     flg_fin = false;
                 }
                 //}
@@ -960,7 +984,7 @@ fn test_best_first_search() {
     assert_eq!(paths.len(), 2);
     // Best case we try to move near the goal forcing the blocking agent out
     assert_eq!(paths[0].path, vec![(1, 0, 0), (1, 0, 1)]);
-    assert_eq!(paths[2].path, vec![(1, 0, 0), (1, 0, 0)]);
+    // assert_eq!(paths[2].path, vec![(1, 0, 0), (1, 0, 0)]);
     assert_eq!(paths[1].path, vec![(1, 0, 0), (1, 1, 0)]);
     assert_eq!(paths[0].need_to_moveout, [0]);
     assert_eq!(paths[1].need_to_moveout, []);
