@@ -84,8 +84,6 @@ fn load_grid() -> (
     let base_obstacles = vec![vec![false; 20]; 20];
     let graph_scale = vec![1.0, 2.0];
     let graph_bound = vec![(20, 20), (10, 10)];
-    
-    
     /// Default
     let agents = vec![
         HeterogenousAgent {
@@ -146,7 +144,7 @@ async fn main() {
         graph_bounds,
         agents.clone(),
     );
-    let steps = 13;
+    let steps = 500;
     println!("Calculated individual agent cost maps");
     let result = het_pibt.solve(steps);
     println!("Result time: {:?}", result);
@@ -173,7 +171,7 @@ async fn main() {
         for (agent, px) in p.iter().enumerate() {
             if let Some((g, x, y)) = px {
                 let g_scale = graph_scale[*g];
-                let h_scale = 20.0;
+                let h_scale = 1.0;
                 let x = *x as f32;
                 let y = *y as f32;
                 let x = x * g_scale * h_scale + g_scale * h_scale / 2.0;

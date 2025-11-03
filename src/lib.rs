@@ -398,7 +398,6 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(Reverse(p)) = self.pq.pop() {
             let (conf, score, curr_time, (parent_graph, parent_x, parent_y)) = p;
-            
             if !self
                 .dont_occupy
                 .contains(&(parent_graph, parent_x, parent_y))
@@ -408,7 +407,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 || (self.curr_loc == (parent_graph, parent_x, parent_y)
                     && curr_time > self.start_time + self.max_lookahead)
             {
-                println!("Returning {} {}", conf, score);
+                //println!("Returning {} {}", conf, score);
                 // Backtrack
                 let mut node = (curr_time, parent_graph, parent_x, parent_y);
                 let mut v = vec![node.clone()];
@@ -495,7 +494,6 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 {
                     continue;
                 }
-         
                 self.came_from.insert(
                     (curr_time + 1, parent_graph, x, y),
                     (curr_time, parent_graph, p.3.1, p.3.2),
@@ -604,10 +602,96 @@ fn evaluate_individual_agent_cost(
     distance_grid
 }
 
+/// Hack, once an agent reaches its end goal do not move out
+fn recalculate_individual_agent_cost(
+    base_obstacles: &Vec<Vec<bool>>,
+    agent: &HeterogenousAgent,
+    graph_scale: &Vec<f32>,
+    all_agents: &Vec<HeterogenousAgent>,
+    agents_at_goal: &HashSet<usize>
+) -> Vec<Vec<i64>> {
+    let width = (((base_obstacles[0].len() as f32) / graph_scale[agent.graph_id]) as usize);
+    let height = (((base_obstacles.len() as f32) / graph_scale[agent.graph_id]) as usize);
+
+    let mut distance_grid = vec![vec![-5; width]; height];
+
+    let collision_checker = MultiGridCollisionChecker{
+        grid_sizes: graph_scale.clone()
+    };
+
+    for x in 0..base_obstacles.len() {
+        for y in 0..base_obstacles[0].len() {
+            if base_obstacles[x][y] {
+                let x = x as f32;
+                let y = y as f32;
+                let x_idx = (x / graph_scale[agent.graph_id]) as usize;
+                let y_idx = (y / graph_scale[agent.graph_id]) as usize;
+                if x_idx >= distance_grid.len() {
+                    continue;
+                }
+                if y_idx >= distance_grid[x_idx].len() {
+                    continue;
+                }
+                distance_grid[x_idx][y_idx] = -1;
+            }
+        }
+    }
+
+    for (agent_id, parked_agent) in all_agents.iter().enumerate() {
+                if !agents_at_goal.contains(&agent_id) {
+                    continue;
+                }
+                let nodes = collision_checker.get_blocked_nodes(parked_agent.graph_id, parked_agent.end.0, parked_agent.end.1);
+                for node in nodes {
+                    if node.0 == agent.graph_id {
+                        if node.1 >= distance_grid.len() {
+                            continue;
+                        }
+                        if node.2 >= distance_grid[node.1].len() {
+                            continue;
+                        }
+                        distance_grid[node.1][node.2] = -1;
+                    }
+                }
+            }
+
+
+    let mut queue = VecDeque::new();
+    queue.push_back((agent.end, 0));
+    let directions = [(-1, 0), (0, -1), (1, 0), (0, 1)];
+    distance_grid[agent.end.0][agent.end.1] = 0;
+
+    while let Some((node, score)) = queue.pop_front() {
+        let (x, y) = node;
+        let (x, y) = (x as i64, y as i64);
+        for &(dx, dy) in &directions {
+            let nx = x + dx;
+            let ny = y + dy;
+
+            // Check bounds
+            if nx >= 0 && ny >= 0 && nx < width as i64 && ny < height as i64 {
+                let n_usize = (nx as usize, ny as usize);
+                // Check if unvisited
+                if distance_grid[n_usize.0][n_usize.1] == -5 {
+                    queue.push_back((n_usize, score + 1));
+                    distance_grid[n_usize.0][n_usize.1] = score + 1;
+                }
+            }
+        }
+    }
+
+    distance_grid
+}
+
+
 /// Heterogenous PiBT using the reasoning module
 pub struct HetPiBT {
     cost_map: Vec<Vec<Vec<i64>>>,
     reservation_system: HeterogenousReservationSystem,
+    base_obstacles: Vec<Vec<bool>>,
+    // Hack: This makes sure no wiggles once we reach a destination
+    goal_reached: HashSet<usize>,
+    agents: Vec<HeterogenousAgent>
 }
 
 impl HetPiBT {
@@ -634,6 +718,9 @@ impl HetPiBT {
         Self {
             cost_map,
             reservation_system,
+            goal_reached: HashSet::new(),
+            base_obstacles: base_obstacles.clone(),
+            agents: agents.clone()
         }
     }
 
@@ -667,8 +754,8 @@ impl HetPiBT {
                 continue;
             }
 
-            println!("Starting agent at {:?}", (graph, x, y));
-            println!("Pushing path  {:?} for agent {}", path, agent_id);
+            //println!("Starting agent at {:?}", (graph, x, y));
+            //println!("Pushing path  {:?} for agent {}", path, agent_id);
             // Hack even though it DFS, we want the earliest node to be expanded to
             // be the first one generated.
             stack.push_back((agent_id, blocked_nodes.clone(), forward_lookup, 0, path));
@@ -677,7 +764,7 @@ impl HetPiBT {
         while let Some((agent_id, blocked_locations, forward_lookup, depth, neighbour)) =
             stack.pop_front()
         {
-            println!("Expanding agent {} {:?}", agent_id, neighbour);
+            //println!("Expanding agent {} {:?}", agent_id, neighbour);
             if neighbour.need_to_moveout.len() == 0 {
                 let mut agent = agent_id;
                 let mut path_to_reserve = HeterogenousTrajectory {
@@ -686,25 +773,25 @@ impl HetPiBT {
                     positions: neighbour.path.iter().map(|&(_, x, y)| (x, y)).collect(),
                 };
 
-                println!("Agent {}", agent);
-                println!("{:?}", path_to_reserve);
-                println!("First path for agent {}: {:?}", agent_id, path_to_reserve);
+                //println!("Agent {}", agent);
+                //println!("{:?}", path_to_reserve);
+                //println!("First path for agent {}: {:?}", agent_id, path_to_reserve);
 
                 while let Err(e) = self
                     .reservation_system
                     .reserve_trajectory(&path_to_reserve, agent)
                 {
-                    println!("Delaying {:?}", e);
+                    //println!("Delaying {:?}", e);
                     path_to_reserve.start_time += 1;
                 }
 
                 // Cascade the delays back up the chain
-                println!("will_affect: {:?}", will_affect);
+                //println!("will_affect: {:?}", will_affect);
                 let mut path_to_study = neighbour.clone();
                 //panic!("");
                 while let Some((agent_id, path)) = will_affect.get(&(agent, path_to_study)) {
                     agent = *agent_id;
-                    println!("Setting {:?} {:?}", agent, path);
+                    // println!("Setting {:?} {:?}", agent, path);
                     path_to_study = path.clone();
                     //panic!("");
                     let mut hypot_path = HeterogenousTrajectory {
@@ -716,15 +803,15 @@ impl HetPiBT {
                         .reservation_system
                         .reserve_trajectory(&hypot_path, agent)
                     {
-                        println!("Delaying {:?}", e);
+                        //println!("Delaying {:?}", e);
                         hypot_path.start_time += 1;
                     }
-                    println!("Chosen path for agent {}: {:?}", path.need_to_moveout[0], hypot_path);
+                    //println!("Chosen path for agent {}: {:?}", path.need_to_moveout[0], hypot_path);
                 }
                 return vec![];
             }
 
-            println!("Exploring path for {}, {}", agent_id, depth);
+            //println!("Exploring path for {}, {}", agent_id, depth);
             let mut c = blocked_locations.clone();
             for &p in &neighbour.path {
                 c.insert(p);
@@ -840,7 +927,7 @@ impl HetPiBT {
                 ))
                 }
                 else {
-                    Some((100000.0,p))
+                    Some((0.0,p))
                 }
             })
             .collect();
@@ -855,6 +942,8 @@ impl HetPiBT {
                 (b, ind)
             })
             .collect();
+
+    let mut needs_recalculation = false;
         for step in 1..max_time_steps {
             let agents = 0..self.reservation_system.max_agents;
             let mut flg_fin = true;
@@ -869,10 +958,9 @@ impl HetPiBT {
                     .get_agent_last_alloc_time(a)
                     .unwrap();
 
-                //if agent.end_time <= step {
                 checked = true;
                 let cost = self.cost_map[a][agent.x][agent.y];
-                println!("cost at current step {}", cost);
+                //println!("cost at current step {}", cost);
                 let Some(&idx) = last_prio.get(&a) else {
                     panic!("Could not find ");
                 };
@@ -883,20 +971,35 @@ impl HetPiBT {
                 // For debugging
                 assert!(x.1 == a);
 
-                println!("Priority at current step {:?} for {}", x, a);
+                //println!("Priority at current step {:?} for {}", x, a);
                 if cost == 0 {
+                    if !self.goal_reached.contains(&x.1) {
+                        self.goal_reached.insert(x.1);
+                        needs_recalculation =true;
+                        println!("{} Reached end point", x.1);
+                    }
                     x.0 = 0.00;
                 } else {
                     x.0 += 1.0 /*+ rand::random::<f32>()*0.1*/;
                     flg_fin = false;
                 }
-                //}
             }
             if !checked {
                 continue;
             }
             if flg_fin {
                 return Some(step);
+            }
+
+            if needs_recalculation  {
+                for agent in 0..self.reservation_system.max_agents {
+                    if self.goal_reached.contains(&agent) {
+                        continue;
+                    }
+                    let p = recalculate_individual_agent_cost(
+                        &self.base_obstacles, &self.agents[agent], &self.reservation_system.collision_checker.grid_sizes, &self.agents, &self.goal_reached);
+                    self.cost_map[agent] = p;
+                }
             }
             agent_priorities.sort_by(|a, b| {
                 let Some(a) = a else {
@@ -925,6 +1028,9 @@ impl HetPiBT {
                 let Some((_cost, agent_id)) = agent else {
                     continue;
                 };
+                if self.goal_reached.contains(&agent_id) {
+                    continue;
+                }
                 let last_time = self
                     .reservation_system
                     .get_agent_last_alloc_time(agent_id)
