@@ -331,6 +331,7 @@ struct BestFirstSearchInstance<'a, 'b, 'c> {
     pq: BinaryHeap<Reverse<(usize, usize, usize, (usize, usize, usize))>>,
     came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
     agent: usize,
+    dont_kickout: HashSet<usize>
     //force_kickout: bool
 }
 
@@ -343,6 +344,7 @@ impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
         start_time: usize,
         max_lookahead: usize,
         agent: usize,
+        dont_kickout: HashSet<usize>
     ) -> Self {
         let mut pq = BinaryHeap::new();
         pq.push(Reverse((0,0, start_time, curr_loc.clone())));
@@ -356,6 +358,7 @@ impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
             pq,
             came_from: HashMap::new(),
             agent,
+            dont_kickout
         }
     }
 
@@ -507,13 +510,21 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 v.reverse();
 
                 let agents_to_kickout = self.evaluate_agents_to_kickout(&v);
+                let mut skip = false;
+                for p in &agents_to_kickout {
+                    if self.dont_kickout.contains(p) {
+                        skip = true;
+                    }
+                }
 
+                if !skip {
                 self.pq.push(Reverse((
                     tentative_g_score,
                     agents_to_kickout.len(),
                     curr_time + 1,
                     (parent_graph, x, y),
                 )));
+            }
             }
         }
         return None;
@@ -747,6 +758,7 @@ impl HetPiBT {
             time,
             forward_lookup,
             agent_id,
+            self.goal_reached.clone()
         );
         let mut will_affect: HashMap<(usize, ProposedPath), (usize, ProposedPath)> = HashMap::new();
         for path in search {
@@ -867,6 +879,7 @@ impl HetPiBT {
                 end_time.end_time,
                 forward_lookup,
                 neighbour.need_to_moveout[0],
+                self.goal_reached.clone()
             );
             let mut v: Vec<_> = search.collect();
             //v.reverse();
@@ -1052,6 +1065,8 @@ impl HetPiBT {
 #[cfg(test)]
 #[test]
 fn test_best_first_search() {
+    use std::collections::hash_set;
+
     let base_obstacles = vec![
         vec![false, false, false, false],
         vec![false, false, false, false],
@@ -1084,6 +1099,7 @@ fn test_best_first_search() {
         0,
         1,
         1,
+        HashSet::new()
     );
     let paths: Vec<_> = search.collect();
     println!("{:?}", paths);

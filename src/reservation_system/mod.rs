@@ -156,9 +156,7 @@ impl HeterogenousReservationSystem {
             }
         }
 
-        println!("Attemping registration");
         let effective_start = trajectory.start_time.min(self.occupied.len());
-        println!("DEBUG: {}", line!());
 
         /// Mark the end location and time.
         let Some(&(last_x, last_y)) = trajectory.positions.last() else {
