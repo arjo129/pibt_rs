@@ -422,12 +422,12 @@ fn test_delay_behaviour() {
     let initial_location1 = HeterogenousTrajectory {
         graph_id: 0,
         start_time: 0,
-        positions: vec![(0,3)]
+        positions: vec![(0, 3)],
     };
     let initial_location2 = HeterogenousTrajectory {
         graph_id: 1,
         start_time: 0,
-        positions: vec![(0,0)]
+        positions: vec![(0, 0)],
     };
     res_sys.reserve_trajectory(&initial_location1, 0);
     res_sys.reserve_trajectory(&initial_location2, 1);

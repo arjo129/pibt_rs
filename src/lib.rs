@@ -331,8 +331,7 @@ struct BestFirstSearchInstance<'a, 'b, 'c> {
     pq: BinaryHeap<Reverse<(usize, usize, usize, (usize, usize, usize))>>,
     came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
     agent: usize,
-    dont_kickout: HashSet<usize>
-    //force_kickout: bool
+    dont_kickout: HashSet<usize>, //force_kickout: bool
 }
 
 impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
@@ -344,10 +343,10 @@ impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
         start_time: usize,
         max_lookahead: usize,
         agent: usize,
-        dont_kickout: HashSet<usize>
+        dont_kickout: HashSet<usize>,
     ) -> Self {
         let mut pq = BinaryHeap::new();
-        pq.push(Reverse((0,0, start_time, curr_loc.clone())));
+        pq.push(Reverse((0, 0, start_time, curr_loc.clone())));
         BestFirstSearchInstance {
             curr_loc,
             start_time,
@@ -358,40 +357,40 @@ impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
             pq,
             came_from: HashMap::new(),
             agent,
-            dont_kickout
+            dont_kickout,
         }
     }
 
-    fn evaluate_agents_to_kickout(&self, v: &Vec<(usize,usize,usize,usize)>) -> HashSet<usize> {
+    fn evaluate_agents_to_kickout(&self, v: &Vec<(usize, usize, usize, usize)>) -> HashSet<usize> {
         let mut agents_to_kickout = HashSet::new();
-                for &(time, graph, x, y) in v.iter() {
-                    let time = self.start_time + time;
-                    for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
-                        if end_time_info.end_time <= time && *agent != self.agent {
-                            agents_to_kickout.insert(*agent);
-                        }
-                    }
+        for &(time, graph, x, y) in v.iter() {
+            let time = self.start_time + time;
+            for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
+                if end_time_info.end_time <= time && *agent != self.agent {
+                    agents_to_kickout.insert(*agent);
+                }
+            }
 
-                    let other_nodes: Vec<_> = self
-                        .res_sys
-                        .collision_checker
-                        .get_blocked_nodes(graph, x, y)
-                        .iter()
-                        .filter(|(g, x, y)| {
-                            self.res_sys.unassigned_agents[*g].len() > *x
-                                && self.res_sys.unassigned_agents[*g][*x].len() > *y
-                        })
-                        .cloned()
-                        .collect();
-                    for (graph, x, y) in other_nodes {
-                        for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
-                            if end_time_info.end_time <= time {
-                                agents_to_kickout.insert(*agent);
-                            }
-                        }
+            let other_nodes: Vec<_> = self
+                .res_sys
+                .collision_checker
+                .get_blocked_nodes(graph, x, y)
+                .iter()
+                .filter(|(g, x, y)| {
+                    self.res_sys.unassigned_agents[*g].len() > *x
+                        && self.res_sys.unassigned_agents[*g][*x].len() > *y
+                })
+                .cloned()
+                .collect();
+            for (graph, x, y) in other_nodes {
+                for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
+                    if end_time_info.end_time <= time {
+                        agents_to_kickout.insert(*agent);
                     }
                 }
-                agents_to_kickout
+            }
+        }
+        agents_to_kickout
     }
 }
 
@@ -404,9 +403,10 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
             if !self
                 .dont_occupy
                 .contains(&(parent_graph, parent_x, parent_y))
-                ||(!self
-                .dont_occupy
-                .contains(&(parent_graph, parent_x, parent_y)) && self.distance_grid[self.agent][parent_x][parent_y] == 0)
+                || (!self
+                    .dont_occupy
+                    .contains(&(parent_graph, parent_x, parent_y))
+                    && self.distance_grid[self.agent][parent_x][parent_y] == 0)
                 || (self.curr_loc == (parent_graph, parent_x, parent_y)
                     && curr_time > self.start_time + self.max_lookahead)
             {
@@ -487,8 +487,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 });
 
             for (x, y) in neighbors {
-                let tentative_g_score =
-                    self.distance_grid[self.agent][x][y].max(0) as usize;
+                let tentative_g_score = self.distance_grid[self.agent][x][y].max(0) as usize;
 
                 // Backtrack
                 if self
@@ -501,7 +500,7 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                     (curr_time + 1, parent_graph, x, y),
                     (curr_time, parent_graph, p.3.1, p.3.2),
                 );
-                 let mut node = (curr_time, parent_graph, x, y);
+                let mut node = (curr_time, parent_graph, x, y);
                 let mut v = vec![node.clone()];
                 while let Some(p) = self.came_from.get(&node) {
                     v.push(p.clone());
@@ -518,13 +517,13 @@ impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
                 }
 
                 if !skip {
-                self.pq.push(Reverse((
-                    tentative_g_score,
-                    agents_to_kickout.len(),
-                    curr_time + 1,
-                    (parent_graph, x, y),
-                )));
-            }
+                    self.pq.push(Reverse((
+                        tentative_g_score,
+                        agents_to_kickout.len(),
+                        curr_time + 1,
+                        (parent_graph, x, y),
+                    )));
+                }
             }
         }
         return None;
@@ -619,15 +618,15 @@ fn recalculate_individual_agent_cost(
     agent: &HeterogenousAgent,
     graph_scale: &Vec<f32>,
     all_agents: &Vec<HeterogenousAgent>,
-    agents_at_goal: &HashSet<usize>
+    agents_at_goal: &HashSet<usize>,
 ) -> Vec<Vec<i64>> {
     let width = (((base_obstacles[0].len() as f32) / graph_scale[agent.graph_id]) as usize);
     let height = (((base_obstacles.len() as f32) / graph_scale[agent.graph_id]) as usize);
 
     let mut distance_grid = vec![vec![-5; width]; height];
 
-    let collision_checker = MultiGridCollisionChecker{
-        grid_sizes: graph_scale.clone()
+    let collision_checker = MultiGridCollisionChecker {
+        grid_sizes: graph_scale.clone(),
     };
 
     for x in 0..base_obstacles.len() {
@@ -649,32 +648,35 @@ fn recalculate_individual_agent_cost(
     }
 
     for (agent_id, parked_agent) in all_agents.iter().enumerate() {
-                if !agents_at_goal.contains(&agent_id) {
+        if !agents_at_goal.contains(&agent_id) {
+            continue;
+        }
+        if parked_agent.graph_id == agent.graph_id {
+            if parked_agent.end.0 >= distance_grid.len() {
+                continue;
+            }
+            if parked_agent.end.1 >= distance_grid[parked_agent.end.0].len() {
+                continue;
+            }
+            distance_grid[parked_agent.end.0][parked_agent.end.1] = -1;
+        }
+        let nodes = collision_checker.get_blocked_nodes(
+            parked_agent.graph_id,
+            parked_agent.end.0,
+            parked_agent.end.1,
+        );
+        for node in nodes {
+            if node.0 == agent.graph_id {
+                if node.1 >= distance_grid.len() {
                     continue;
                 }
-                if parked_agent.graph_id == agent.graph_id {
-                    if parked_agent.end.0 >= distance_grid.len() {
-                        continue;
-                    }
-                    if parked_agent.end.1 >= distance_grid[parked_agent.end.0].len() {
-                        continue;
-                    }
-                    distance_grid[parked_agent.end.0][parked_agent.end.1] = -1;
+                if node.2 >= distance_grid[node.1].len() {
+                    continue;
                 }
-                let nodes = collision_checker.get_blocked_nodes(parked_agent.graph_id, parked_agent.end.0, parked_agent.end.1);
-                for node in nodes {
-                    if node.0 == agent.graph_id {
-                        if node.1 >= distance_grid.len() {
-                            continue;
-                        }
-                        if node.2 >= distance_grid[node.1].len() {
-                            continue;
-                        }
-                        distance_grid[node.1][node.2] = -1;
-                    }
-                }
+                distance_grid[node.1][node.2] = -1;
             }
-
+        }
+    }
 
     let mut queue = VecDeque::new();
     queue.push_back((agent.end, 0));
@@ -703,7 +705,6 @@ fn recalculate_individual_agent_cost(
     distance_grid
 }
 
-
 /// Heterogenous PiBT using the reasoning module
 pub struct HetPiBT {
     cost_map: Vec<Vec<Vec<i64>>>,
@@ -711,7 +712,7 @@ pub struct HetPiBT {
     base_obstacles: Vec<Vec<bool>>,
     // Hack: This makes sure no wiggles once we reach a destination
     goal_reached: HashSet<usize>,
-    agents: Vec<HeterogenousAgent>
+    agents: Vec<HeterogenousAgent>,
 }
 
 impl HetPiBT {
@@ -740,7 +741,7 @@ impl HetPiBT {
             reservation_system,
             goal_reached: HashSet::new(),
             base_obstacles: base_obstacles.clone(),
-            agents: agents.clone()
+            agents: agents.clone(),
         }
     }
 
@@ -767,7 +768,7 @@ impl HetPiBT {
             time,
             forward_lookup,
             agent_id,
-            self.goal_reached.clone()
+            self.goal_reached.clone(),
         );
         let mut will_affect: HashMap<(usize, ProposedPath), (usize, ProposedPath)> = HashMap::new();
         for path in search {
@@ -888,7 +889,7 @@ impl HetPiBT {
                 end_time.end_time,
                 forward_lookup,
                 neighbour.need_to_moveout[0],
-                self.goal_reached.clone()
+                self.goal_reached.clone(),
             );
             let mut v: Vec<_> = search.collect();
             //v.reverse();
@@ -898,8 +899,7 @@ impl HetPiBT {
                     continue;
                 }
 
-                if will_affect.contains_key(&(agent_id,neighbour.clone()))
-                {
+                if will_affect.contains_key(&(agent_id, neighbour.clone())) {
                     //Deadlock
                     continue;
                 }
@@ -996,7 +996,7 @@ impl HetPiBT {
                 if cost == 0 {
                     if !self.goal_reached.contains(&x.1) {
                         self.goal_reached.insert(x.1);
-                        needs_recalculation =true;
+                        needs_recalculation = true;
                         println!("{} Reached end point", x.1);
                     }
                     x.0 = 0.00;
@@ -1012,13 +1012,18 @@ impl HetPiBT {
                 return Some(step);
             }
 
-            if needs_recalculation  {
+            if needs_recalculation {
                 for agent in 0..self.reservation_system.max_agents {
                     if self.goal_reached.contains(&agent) {
                         continue;
                     }
                     let p = recalculate_individual_agent_cost(
-                        &self.base_obstacles, &self.agents[agent], &self.reservation_system.collision_checker.grid_sizes, &self.agents, &self.goal_reached);
+                        &self.base_obstacles,
+                        &self.agents[agent],
+                        &self.reservation_system.collision_checker.grid_sizes,
+                        &self.agents,
+                        &self.goal_reached,
+                    );
                     self.cost_map[agent] = p;
                 }
             }
@@ -1107,7 +1112,7 @@ fn test_best_first_search() {
         0,
         1,
         1,
-        HashSet::new()
+        HashSet::new(),
     );
     let paths: Vec<_> = search.collect();
     println!("{:?}", paths);

@@ -28,7 +28,6 @@ fn test_swap_case() {
     assert!(result.is_some());
 }
 
-
 #[test]
 fn test_het_swap_case() {
     let base_obstacles = vec![vec![false; 20]; 20];
@@ -84,7 +83,6 @@ fn test_push_case() {
     let result = het_pibt.solve(20);
     assert!(result.is_some());
 }
-
 
 #[test]
 fn test_default_case() {
