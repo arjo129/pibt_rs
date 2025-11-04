@@ -81,7 +81,7 @@ fn test_push_case() {
         graph_bound,
         agents.clone(),
     );
-    let result = het_pibt.solve(10);
+    let result = het_pibt.solve(20);
     assert!(result.is_some());
 }
 

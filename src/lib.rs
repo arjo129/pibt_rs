@@ -652,6 +652,15 @@ fn recalculate_individual_agent_cost(
                 if !agents_at_goal.contains(&agent_id) {
                     continue;
                 }
+                if parked_agent.graph_id == agent.graph_id {
+                    if parked_agent.end.0 >= distance_grid.len() {
+                        continue;
+                    }
+                    if parked_agent.end.1 >= distance_grid[parked_agent.end.0].len() {
+                        continue;
+                    }
+                    distance_grid[parked_agent.end.0][parked_agent.end.1] = -1;
+                }
                 let nodes = collision_checker.get_blocked_nodes(parked_agent.graph_id, parked_agent.end.0, parked_agent.end.1);
                 for node in nodes {
                     if node.0 == agent.graph_id {
@@ -955,14 +964,13 @@ impl HetPiBT {
                 (b, ind)
             })
             .collect();
-
-    let mut needs_recalculation = false;
         for step in 1..max_time_steps {
             let agents = 0..self.reservation_system.max_agents;
             let mut flg_fin = true;
             let mut checked = false;
             println!("===========================================");
             println!("Step {:?}", step);
+            let mut needs_recalculation = false;
 
             self.reservation_system.extend_by_one_timestep();
             for a in agents {
