@@ -146,7 +146,9 @@ async fn main() {
     );
     let steps = 500;
     println!("Calculated individual agent cost maps");
+    let solve_start = std::time::SystemTime::now();
     let result = het_pibt.solve(steps);
+    println!("Solver duration: {:?}", solve_start.elapsed());
     println!("Result time: {:?}", result);
     let mut last_update = std::time::SystemTime::now();
     let mut time = 0;
