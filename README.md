@@ -1,6 +1,6 @@
 # `hetpibt` - A Rust Implementation of (Heterogenous) PIBT
 
-This crate provides a simple implementation of Push and Rotate (PIBT), a multi-agent pathfinding algorithm. It also includes two experimental implementations of Heterogenous PIBT: one using a reasoning module with winPiBT, and another using Conflict-Based Search (CBS) as a protocol.
+This crate provides a simple implementation of Priority Inhertiance and Back Tracking (PIBT), a multi-agent pathfinding algorithm. It also includes two experimental implementations of Heterogenous PIBT: one using a reasoning module with winPiBT, and another using Conflict-Based Search (CBS) as a protocol.
 
 ## Installation
 
