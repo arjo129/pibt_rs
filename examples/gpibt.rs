@@ -1,4 +1,7 @@
-use macroquad::prelude::*;
+use std::{num::NonZeroU16, ops::DerefMut};
+
+use ::rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+use macroquad::{miniquad::gl::WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB, prelude::*};
 use serde::{Deserialize, Serialize};
 
 /// Geometry utility: computes the centroid of a 2D polygon from its vertices.
@@ -78,12 +81,7 @@ pub fn segment_intersects_aabb(
     let mut t1 = 1.0f32;
 
     let p = [-dx, dx, -dy, dy];
-    let q = [
-        p1.0 - min_x,
-        max_x - p1.0,
-        p1.1 - min_y,
-        max_y - p1.1,
-    ];
+    let q = [p1.0 - min_x, max_x - p1.0, p1.1 - min_y, max_y - p1.1];
 
     for i in 0..4 {
         if p[i].abs() < 1e-8 {
@@ -257,8 +255,8 @@ impl Polygon {
         for i in 0..n {
             let (xi, yi) = b[i];
             let (xj, yj) = b[j];
-            let intersect = ((yi > p.1) != (yj > p.1))
-                && (p.0 < (xj - xi) * (p.1 - yi) / (yj - yi) + xi);
+            let intersect =
+                ((yi > p.1) != (yj > p.1)) && (p.0 < (xj - xi) * (p.1 - yi) / (yj - yi) + xi);
             if intersect {
                 inside = !inside;
             }
@@ -568,7 +566,10 @@ impl PolygonBitmapGrid {
     pub fn grid_to_cell_bounds(&self, gx: usize, gy: usize) -> ((f32, f32), (f32, f32)) {
         let min_x = self.origin.0 + gx as f32 * self.resolution;
         let min_y = self.origin.1 + gy as f32 * self.resolution;
-        ((min_x, min_y), (min_x + self.resolution, min_y + self.resolution))
+        (
+            (min_x, min_y),
+            (min_x + self.resolution, min_y + self.resolution),
+        )
     }
 
     /// Returns the slice of rasterized polygon IDs at grid cell (gx, gy).
@@ -790,11 +791,7 @@ pub fn generate_non_uniform_navmesh() -> NavGraph {
     let n6 = nav.add_rectangle(380.0, 130.0, 80.0, 110.0);
 
     // Node 7: South Triangular Atrium / Foyer
-    let n7 = nav.add_polygon_from_vertices(vec![
-        (210.0, 230.0),
-        (290.0, 230.0),
-        (250.0, 310.0),
-    ]);
+    let n7 = nav.add_polygon_from_vertices(vec![(210.0, 230.0), (290.0, 230.0), (250.0, 310.0)]);
 
     // Connect the non-uniform navmesh nodes
     nav.add_edge(n1, n2, GuidePreference::NONE);
@@ -808,135 +805,233 @@ pub fn generate_non_uniform_navmesh() -> NavGraph {
     nav
 }
 
+struct PIBTOverNavGraph {
+    nav_graph: NavGraph,
+    q: Vec<Vec<Option<usize>>>,
+    // TODO(arjoc): Only compute distance matrix for agents
+    distance_matrix: DistanceMatrix,
+    rng: StdRng,
+    // TODO(arjoc): Remove this
+    ends: Vec<usize>,
+    occupied_now: Vec<Option<usize>>,
+    occupied_nxt: Vec<Option<usize>>,
+}
+
+impl PIBTOverNavGraph {
+    pub fn init(nav_graph: NavGraph) -> Self {
+        let distance_matrix = DistanceMatrix::from(&nav_graph);
+        let nav_graph_len = nav_graph.polygons.len();
+        Self {
+            nav_graph,
+            distance_matrix,
+            q: vec![],
+            rng: StdRng::seed_from_u64(42),
+            ends: vec![], //hacky remove this once we fix the Distance Matrix API
+            occupied_now: vec![None; nav_graph_len],
+            occupied_nxt: vec![None; nav_graph_len],
+        }
+    }
+
+    fn pibt(&mut self, agent: usize, time: usize) -> bool {
+        let Some(q_from) = self.q[time][agent] else {
+            // SAFETY: pibt is a private API that should only be called from within this file
+            // Before we call it we already populate all positions for the agent at timestap t.
+            panic!("Accessed an agent wuth no position");
+        };
+        let mut neighbors = self.nav_graph.connections[q_from].clone();
+        neighbors.shuffle(&mut self.rng);
+
+        let goal_node = self.ends[agent];
+
+        neighbors.sort_by(|pos1, pos2| {
+            // Get agent's goal
+            let dist1 = self.distance_matrix.matrix[pos1.0][goal_node];
+            let dist2 = self.distance_matrix.matrix[pos2.0][goal_node];
+            dist1.cmp(&dist2)
+        });
+
+        for (node_id, _) in neighbors {
+            // vertex conflict
+            if self.occupied_nxt[node_id] != None {
+                continue;
+            }
+
+            let agent_to_move_out = self.occupied_now[node_id];
+
+            //swap conflicts
+            if let Some(agent_to_move_out) = agent_to_move_out {
+                if self.q[time][agent] == self.q[time + 1][agent_to_move_out] {
+                    continue;
+                }
+            }
+
+            // Reserve next location
+            self.occupied_nxt[node_id] = Some(agent);
+            self.q[time + 1][agent] = Some(node_id);
+
+            if let Some(agent_to_move_out) = agent_to_move_out {
+                if self.q[time + 1][agent_to_move_out] == None {
+                    if !self.pibt(agent_to_move_out, time) {
+                        continue;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        self.occupied_nxt[self.q[time][agent].unwrap()] = Some(agent);
+        self.q[time + 1][agent] = self.q[time][agent];
+        false
+    }
+
+    fn is_solution(&self, t: usize) -> bool {
+        if self.q[t].len() != self.ends.len() {
+            return false;
+        }
+
+        for item in 0..self.q[t].len() {
+            let Some(val) = self.q[t][item] else {
+                return false;
+            };
+
+            if val != self.ends[item] {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn solve(
+        &mut self,
+        starts: Vec<(f32, f32)>,
+        ends: Vec<(f32, f32)>,
+        max_time: usize,
+    ) -> Vec<Vec<(f32, f32)>> {
+        let mut agents: Vec<_> = (0..starts.len()).collect();
+        let mut final_trajectory = vec![];
+
+        let bitmap = self.nav_graph.build_bitmap_grid(1.0);
+
+        let initial_position: Vec<_> = starts
+            .iter()
+            .map(|(x, y)| bitmap.get_polygon_at(*x, *y, &self.nav_graph))
+            .collect();
+        let final_position: Vec<_> = ends
+            .iter()
+            .map(|(x, y)| bitmap.get_polygon_at(*x, *y, &self.nav_graph))
+            .collect();
+
+        // TODO(arjoc): return an error
+        self.ends = final_position.iter().map(|p| p.unwrap()).collect();
+
+        for (agent, node) in initial_position.iter().enumerate() {
+            let Some(node) = node else {
+                continue;
+            };
+            self.occupied_now[*node] = Some(agent);
+        }
+
+        self.q.push(initial_position.clone());
+        self.q
+            .extend((1..max_time).map(|_| vec![None; agents.len()]));
+
+        let mut priorities: Vec<_> = (0..starts.len())
+            .map(|agent| {
+                self.distance_matrix.matrix[initial_position[agent].unwrap()]
+                    [final_position[agent].unwrap()]
+            })
+            .collect();
+        for t in 1..max_time - 1 {
+            agents.sort_by(|p, q| priorities[*p].cmp(&priorities[*q]));
+            for agent in &agents {
+                if self.q[t][*agent] != None {
+                    continue;
+                }
+
+                self.pibt(*agent, t - 1);
+            }
+
+            self.occupied_now = self.occupied_nxt.clone();
+            self.occupied_nxt = vec![None; self.occupied_nxt.len()];
+
+            if self.is_solution(t) {
+                for i in 0..=t {
+                    final_trajectory.push(
+                        self.q[i]
+                            .iter()
+                            .map(|p| {
+                                if let Some(p) = p {
+                                    self.nav_graph.polygon_centroid(*p).unwrap()
+                                } else {
+                                    (-1.0, -1.0)
+                                }
+                            })
+                            .collect(),
+                    )
+                }
+                break;
+            }
+        }
+
+        final_trajectory
+    }
+}
+
 #[macroquad::main("gpibt nav-mesh demo")]
 async fn main() {
-    let mut show_raster_grid = true;
-    let mut use_non_uniform = true;
+    let nav = generate_grid((100.0, 100.0), 60.0, 5, 5);
 
-    let mut nav = generate_non_uniform_navmesh();
-    let raster_resolution = 5.0f32;
-    let mut bitmap = nav.build_bitmap_grid(raster_resolution);
-    let mut _dm = DistanceMatrix::from(&nav);
+    // Spawn 4 robots at the 4 corners of the 5x5 grid targeting the opposite corners
+    let starts = vec![
+        nav.polygons[0].centroid,  // (0, 0)
+        nav.polygons[4].centroid,  // (0, 4)
+        nav.polygons[20].centroid, // (4, 0)
+        nav.polygons[24].centroid, // (4, 4)
+    ];
+    let ends = vec![
+        nav.polygons[24].centroid, // (4, 4)
+        nav.polygons[20].centroid, // (4, 0)
+        nav.polygons[4].centroid,  // (0, 4)
+        nav.polygons[0].centroid,  // (0, 0)
+    ];
+
+    let mut solver = PIBTOverNavGraph::init(nav.clone());
+    let trajectories = solver.solve(starts, ends.clone(), 50);
+
+    let agent_colors = [
+        Color::new(0.95, 0.30, 0.30, 1.0), // Red
+        Color::new(0.30, 0.85, 0.45, 1.0), // Green
+        Color::new(0.30, 0.60, 0.95, 1.0), // Blue
+        Color::new(0.95, 0.80, 0.25, 1.0), // Yellow
+    ];
+
+    let mut last_update = std::time::Instant::now();
+    let mut time = 0usize;
 
     loop {
         clear_background(Color::new(0.08, 0.08, 0.1, 1.0));
 
-        // Switch modes with keyboard
-        if is_key_pressed(KeyCode::Key1) && !use_non_uniform {
-            use_non_uniform = true;
-            nav = generate_non_uniform_navmesh();
-            bitmap = nav.build_bitmap_grid(raster_resolution);
-            _dm = DistanceMatrix::from(&nav);
-        } else if is_key_pressed(KeyCode::Key2) && use_non_uniform {
-            use_non_uniform = false;
-            nav = generate_grid((60.0, 60.0), 30.0, 12, 10);
-            bitmap = nav.build_bitmap_grid(raster_resolution);
-            _dm = DistanceMatrix::from(&nav);
-        }
-
-        if is_key_pressed(KeyCode::G) {
-            show_raster_grid = !show_raster_grid;
-        }
-
-        // Draw optional raster grid wireframe
-        if show_raster_grid {
-            bitmap.draw_debug_grid(Color::new(0.2, 0.2, 0.25, 0.4));
-        }
-
-        // Draw NavGraph polygons and connections
+        // Draw 5x5 navigation grid and connections
         nav.draw_styled(Color::new(0.7, 0.7, 0.8, 1.0), 2.0, true);
 
-        // Draw node centroids
-        for (id, poly) in nav.polygons.iter().enumerate() {
-            let (cx, cy) = poly.centroid;
-            draw_circle(cx, cy, 3.0, Color::new(0.9, 0.6, 0.2, 0.8));
-            draw_text(&format!("{}", id), cx - 4.0, cy - 6.0, 16.0, Color::new(0.9, 0.9, 0.9, 0.9));
+        // Draw goal markers for each agent
+        for (agent, &(gx, gy)) in ends.iter().enumerate() {
+            draw_circle_lines(gx, gy, 18.0, 2.0, agent_colors[agent]);
         }
 
-        // Real-time arbitrary (x, y) location mapping
-        let (mx, my) = mouse_position();
-        let hovered_poly = bitmap.get_polygon_at(mx, my, &nav);
+        // Draw agents at current timestep
+        if !trajectories.is_empty() {
+            for (agent, &(x, y)) in trajectories[time].iter().enumerate() {
+                draw_circle(x, y, 14.0, agent_colors[agent]);
+            }
 
-        // Highlight hovered cell in bitmap
-        if let Some((gx, gy)) = bitmap.world_to_grid(mx, my) {
-            bitmap.draw_cell(gx, gy, Color::new(0.3, 0.5, 0.8, 0.35));
-        }
-
-        // If hovered over a valid polygon on the NavGraph:
-        if let Some(poly_id) = hovered_poly {
-            let poly = &nav.polygons[poly_id];
-            // Highlight polygon area
-            poly.draw_filled(Color::new(0.1, 0.8, 0.4, 0.3));
-            poly.draw_styled(GREEN, 2.5);
-
-            // Go back from polygon to centroid
-            if let Some((cx, cy)) = bitmap.polygon_to_point(&nav, poly_id) {
-                // Draw connecting line from arbitrary point (mx, my) to centroid (cx, cy)
-                draw_line(mx, my, cx, cy, 2.0, YELLOW);
-                draw_circle(cx, cy, 5.0, YELLOW);
-                draw_circle(mx, my, 4.0, Color::new(1.0, 0.4, 0.2, 1.0));
+            if last_update.elapsed().as_secs_f32() >= 0.5 {
+                time = (time + 1) % trajectories.len();
+                last_update = std::time::Instant::now();
             }
         }
-
-        // HUD / Instructions overlay
-        draw_rectangle(10.0, 10.0, 520.0, 115.0, Color::new(0.05, 0.05, 0.08, 0.85));
-        draw_rectangle_lines(10.0, 10.0, 520.0, 115.0, 1.0, Color::new(0.3, 0.3, 0.4, 1.0));
-
-        let mode_str = if use_non_uniform {
-            "Non-Uniform NavMesh"
-        } else {
-            "Uniform Grid (30x30)"
-        };
-        draw_text(
-            &format!("Mode: {} (Press [1] Non-Uniform | [2] Uniform)", mode_str),
-            20.0,
-            30.0,
-            16.0,
-            WHITE,
-        );
-        draw_text(
-            &format!("Bitmap Resolution: {:.1}px | Press [G] Toggle Raster Wireframe ({})",
-                raster_resolution, if show_raster_grid { "ON" } else { "OFF" }
-            ),
-            20.0,
-            50.0,
-            15.0,
-            LIGHTGRAY,
-        );
-        draw_text(
-            &format!("Mouse (x, y): ({:.1}, {:.1})", mx, my),
-            20.0,
-            72.0,
-            16.0,
-            Color::new(0.6, 0.8, 1.0, 1.0),
-        );
-
-        if let Some(poly_id) = hovered_poly {
-            let (cx, cy) = bitmap.polygon_to_point(&nav, poly_id).unwrap();
-            draw_text(
-                &format!("-> Polygon ID: {} | Centroid (Back): ({:.1}, {:.1})", poly_id, cx, cy),
-                20.0,
-                95.0,
-                16.0,
-                GREEN,
-            );
-        } else {
-            draw_text(
-                "-> Polygon ID: None (Outside NavGraph)",
-                20.0,
-                95.0,
-                16.0,
-                Color::new(0.7, 0.3, 0.3, 1.0),
-            );
-        }
-
-        draw_text(
-            "Move mouse over polygons to test (x,y) -> Polygon -> Centroid mapping",
-            20.0,
-            116.0,
-            13.0,
-            GRAY,
-        );
 
         next_frame().await;
     }
@@ -967,10 +1062,8 @@ mod tests {
         for i in 0..width {
             for j in 0..height {
                 let id = i * height + j;
-                let expected_centroid = (
-                    (i as f32 + 0.5) * grid_size,
-                    (j as f32 + 0.5) * grid_size,
-                );
+                let expected_centroid =
+                    ((i as f32 + 0.5) * grid_size, (j as f32 + 0.5) * grid_size);
                 assert!((nav.polygons[id].centroid.0 - expected_centroid.0).abs() < 1e-5);
                 assert!((nav.polygons[id].centroid.1 - expected_centroid.1).abs() < 1e-5);
 
@@ -1055,11 +1148,7 @@ mod tests {
     #[test]
     fn test_polygon_centroid_computation() {
         // Triangle with known centroid at (10, 10)
-        let tri = Polygon::from_vertices(vec![
-            (0.0, 0.0),
-            (30.0, 0.0),
-            (0.0, 30.0),
-        ]);
+        let tri = Polygon::from_vertices(vec![(0.0, 0.0), (30.0, 0.0), (0.0, 30.0)]);
         assert!((tri.centroid.0 - 10.0).abs() < 1e-4);
         assert!((tri.centroid.1 - 10.0).abs() < 1e-4);
 
@@ -1072,10 +1161,38 @@ mod tests {
     #[test]
     fn test_segment_intersects_aabb() {
         // AABB [10, 20] x [10, 20]
-        assert!(segment_intersects_aabb((0.0, 15.0), (30.0, 15.0), 10.0, 10.0, 20.0, 20.0));
-        assert!(segment_intersects_aabb((12.0, 12.0), (18.0, 18.0), 10.0, 10.0, 20.0, 20.0));
-        assert!(!segment_intersects_aabb((0.0, 5.0), (30.0, 5.0), 10.0, 10.0, 20.0, 20.0));
-        assert!(!segment_intersects_aabb((0.0, 0.0), (5.0, 5.0), 10.0, 10.0, 20.0, 20.0));
+        assert!(segment_intersects_aabb(
+            (0.0, 15.0),
+            (30.0, 15.0),
+            10.0,
+            10.0,
+            20.0,
+            20.0
+        ));
+        assert!(segment_intersects_aabb(
+            (12.0, 12.0),
+            (18.0, 18.0),
+            10.0,
+            10.0,
+            20.0,
+            20.0
+        ));
+        assert!(!segment_intersects_aabb(
+            (0.0, 5.0),
+            (30.0, 5.0),
+            10.0,
+            10.0,
+            20.0,
+            20.0
+        ));
+        assert!(!segment_intersects_aabb(
+            (0.0, 0.0),
+            (5.0, 5.0),
+            10.0,
+            10.0,
+            20.0,
+            20.0
+        ));
     }
 
     #[test]
@@ -1110,7 +1227,14 @@ mod tests {
                 ];
                 for pt in test_pts {
                     let res = bitmap.get_polygon_at(pt.0, pt.1, &nav);
-                    assert_eq!(res, Some(id), "Point ({}, {}) should map to polygon {}", pt.0, pt.1, id);
+                    assert_eq!(
+                        res,
+                        Some(id),
+                        "Point ({}, {}) should map to polygon {}",
+                        pt.0,
+                        pt.1,
+                        id
+                    );
                 }
             }
         }
@@ -1131,7 +1255,12 @@ mod tests {
         for (id, poly) in nav.polygons.iter().enumerate() {
             // Centroid maps to this polygon
             let mapped_centroid = bitmap.get_polygon_at(poly.centroid.0, poly.centroid.1, &nav);
-            assert_eq!(mapped_centroid, Some(id), "Centroid of polygon {} should map to itself", id);
+            assert_eq!(
+                mapped_centroid,
+                Some(id),
+                "Centroid of polygon {} should map to itself",
+                id
+            );
 
             // Centroid lookup from polygon ID
             let centroid_back = bitmap.polygon_to_point(&nav, id);
