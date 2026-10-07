@@ -764,6 +764,76 @@ pub fn generate_grid(start: (f32, f32), grid_size: f32, width: usize, height: us
     nav
 }
 
+/// Generates a 3x7 center highway with 3 drop-off points on either side (left and right),
+/// using wider outer lanes and larger drop-off bays to demonstrate varied polygon sizes.
+///
+/// Layout:
+/// - Nodes `0..21`: 3 columns (`i in 0..3`) x 7 rows (`j in 0..7`) center highway (`i * 7 + j`).
+///   Outer lanes (`i = 0, 2`) are wider (`1.3 * grid_size`) than the center lane (`1.0 * grid_size`).
+/// - Nodes `21..24`: 3 left-side drop-off bays (`1.6 * grid_size` x `1.2 * grid_size`) at rows `j = 1, 3, 5`, connected to `(0, j)`.
+/// - Nodes `24..27`: 3 right-side drop-off bays (`1.6 * grid_size` x `1.2 * grid_size`) at rows `j = 1, 3, 5`, connected to `(2, j)`.
+pub fn generate_highway_with_dropoffs(start: (f32, f32), grid_size: f32) -> NavGraph {
+    let mut nav = NavGraph::default();
+    let width = 3;
+    let height = 7;
+    let (start_x, start_y) = start;
+
+    let lane_widths = [1.3 * grid_size, grid_size, 1.3 * grid_size];
+    let lane_x_offsets = [
+        start_x,
+        start_x + lane_widths[0],
+        start_x + lane_widths[0] + lane_widths[1],
+    ];
+    let total_highway_width: f32 = lane_widths.iter().sum();
+
+    for i in 0..width {
+        let min_x = lane_x_offsets[i];
+        let w = lane_widths[i];
+        for j in 0..height {
+            let min_y = start_y + j as f32 * grid_size;
+            nav.add_rectangle(min_x, min_y, w, grid_size);
+        }
+    }
+
+    let node_id = |i: usize, j: usize| i * height + j;
+
+    for i in 0..width {
+        for j in 0..height {
+            let current = node_id(i, j);
+            if i + 1 < width {
+                nav.add_edge(current, node_id(i + 1, j), GuidePreference::NONE);
+            }
+            if j + 1 < height {
+                nav.add_edge(current, node_id(i, j + 1), GuidePreference::NONE);
+            }
+        }
+    }
+
+    let dropoff_rows = [1usize, 3, 5];
+    let dropoff_w = 1.6 * grid_size;
+    let dropoff_h = 1.2 * grid_size;
+
+    // 3 wider drop-off bays on the left side (connected to column 0)
+    for &j in &dropoff_rows {
+        let row_center_y = start_y + (j as f32 + 0.5) * grid_size;
+        let min_x = start_x - dropoff_w;
+        let min_y = row_center_y - 0.5 * dropoff_h;
+        let dropoff_id = nav.add_rectangle(min_x, min_y, dropoff_w, dropoff_h);
+        nav.add_edge(dropoff_id, node_id(0, j), GuidePreference::NONE);
+    }
+
+    // 3 wider drop-off bays on the right side (connected to column 2)
+    for &j in &dropoff_rows {
+        let row_center_y = start_y + (j as f32 + 0.5) * grid_size;
+        let min_x = start_x + total_highway_width;
+        let min_y = row_center_y - 0.5 * dropoff_h;
+        let dropoff_id = nav.add_rectangle(min_x, min_y, dropoff_w, dropoff_h);
+        nav.add_edge(dropoff_id, node_id(width - 1, j), GuidePreference::NONE);
+    }
+
+    nav
+}
+
 /// Generates a realistic non-uniform nav-mesh graph with variable-sized rooms,
 /// narrow corridors, and an angled triangular foyer.
 pub fn generate_non_uniform_navmesh() -> NavGraph {
@@ -839,9 +909,11 @@ impl PIBTOverNavGraph {
             panic!("Accessed an agent wuth no position");
         };
         let mut neighbors = self.nav_graph.connections[q_from].clone();
-        neighbors.shuffle(&mut self.rng);
-
         let goal_node = self.ends[agent];
+        if q_from == goal_node {
+            neighbors.push((q_from, GuidePreference::NONE));
+        }
+        neighbors.shuffle(&mut self.rng);
 
         neighbors.sort_by(|pos1, pos2| {
             // Get agent's goal
@@ -860,7 +932,9 @@ impl PIBTOverNavGraph {
 
             //swap conflicts
             if let Some(agent_to_move_out) = agent_to_move_out {
-                if self.q[time][agent] == self.q[time + 1][agent_to_move_out] {
+                if agent_to_move_out != agent
+                    && self.q[time][agent] == self.q[time + 1][agent_to_move_out]
+                {
                     continue;
                 }
             }
@@ -870,8 +944,9 @@ impl PIBTOverNavGraph {
             self.q[time + 1][agent] = Some(node_id);
 
             if let Some(agent_to_move_out) = agent_to_move_out {
-                if self.q[time + 1][agent_to_move_out] == None {
+                if agent_to_move_out != agent && self.q[time + 1][agent_to_move_out] == None {
                     if !self.pibt(agent_to_move_out, time) {
+                        self.q[time + 1][agent] = None;
                         continue;
                     }
                 }
@@ -880,8 +955,8 @@ impl PIBTOverNavGraph {
             return true;
         }
 
-        self.occupied_nxt[self.q[time][agent].unwrap()] = Some(agent);
-        self.q[time + 1][agent] = self.q[time][agent];
+        self.occupied_nxt[q_from] = Some(agent);
+        self.q[time + 1][agent] = Some(q_from);
         false
     }
 
@@ -944,13 +1019,21 @@ impl PIBTOverNavGraph {
             })
             .collect();
         for t in 1..max_time - 1 {
-            agents.sort_by(|p, q| priorities[*p].cmp(&priorities[*q]));
+            agents.sort_by(|p, q| priorities[*q].cmp(&priorities[*p]));
             for agent in &agents {
                 if self.q[t][*agent] != None {
                     continue;
                 }
 
                 self.pibt(*agent, t - 1);
+            }
+
+            for agent in 0..starts.len() {
+                if self.q[t][agent] != Some(self.ends[agent]) {
+                    priorities[agent] += 1;
+                } else {
+                    priorities[agent] = 0;
+                }
             }
 
             self.occupied_now = self.occupied_nxt.clone();
@@ -981,20 +1064,24 @@ impl PIBTOverNavGraph {
 
 #[macroquad::main("gpibt nav-mesh demo")]
 async fn main() {
-    let nav = generate_grid((100.0, 100.0), 60.0, 5, 5);
+    let nav = generate_highway_with_dropoffs((292.0, 90.0), 60.0);
 
-    // Spawn 4 robots at the 4 corners of the 5x5 grid targeting the opposite corners
+    // Spawn 6 robots at the 6 drop-off bays (3 on left, 3 on right) targeting opposite bays
     let starts = vec![
-        nav.polygons[0].centroid,  // (0, 0)
-        nav.polygons[4].centroid,  // (0, 4)
-        nav.polygons[20].centroid, // (4, 0)
-        nav.polygons[24].centroid, // (4, 4)
+        nav.polygons[21].centroid, // Left drop-off 0 (row 1)
+        nav.polygons[22].centroid, // Left drop-off 1 (row 3)
+        nav.polygons[23].centroid, // Left drop-off 2 (row 5)
+        nav.polygons[24].centroid, // Right drop-off 0 (row 1)
+        nav.polygons[25].centroid, // Right drop-off 1 (row 3)
+        nav.polygons[26].centroid, // Right drop-off 2 (row 5)
     ];
     let ends = vec![
-        nav.polygons[24].centroid, // (4, 4)
-        nav.polygons[20].centroid, // (4, 0)
-        nav.polygons[4].centroid,  // (0, 4)
-        nav.polygons[0].centroid,  // (0, 0)
+        nav.polygons[26].centroid, // Right drop-off 2 (row 5)
+        nav.polygons[25].centroid, // Right drop-off 1 (row 3)
+        nav.polygons[24].centroid, // Right drop-off 0 (row 1)
+        nav.polygons[23].centroid, // Left drop-off 2 (row 5)
+        nav.polygons[22].centroid, // Left drop-off 1 (row 3)
+        nav.polygons[21].centroid, // Left drop-off 0 (row 1)
     ];
 
     let mut solver = PIBTOverNavGraph::init(nav.clone());
@@ -1005,6 +1092,8 @@ async fn main() {
         Color::new(0.30, 0.85, 0.45, 1.0), // Green
         Color::new(0.30, 0.60, 0.95, 1.0), // Blue
         Color::new(0.95, 0.80, 0.25, 1.0), // Yellow
+        Color::new(0.85, 0.40, 0.95, 1.0), // Purple
+        Color::new(0.25, 0.90, 0.90, 1.0), // Cyan
     ];
 
     let mut last_update = std::time::Instant::now();
@@ -1013,7 +1102,7 @@ async fn main() {
     loop {
         clear_background(Color::new(0.08, 0.08, 0.1, 1.0));
 
-        // Draw 5x5 navigation grid and connections
+        // Draw 3x7 center highway with 3 drop-off points on either side and connections
         nav.draw_styled(Color::new(0.7, 0.7, 0.8, 1.0), 2.0, true);
 
         // Draw goal markers for each agent
@@ -1344,5 +1433,63 @@ mod tests {
         assert_eq!(bitmap.height, deserialized.height);
         assert_eq!(bitmap.resolution, deserialized.resolution);
         assert_eq!(bitmap.cells, deserialized.cells);
+    }
+
+    #[test]
+    fn test_highway_with_dropoffs_topology_and_pibt() {
+        let nav = generate_highway_with_dropoffs((310.0, 90.0), 60.0);
+        // 3x7 center highway (21 nodes) + 3 left drop-offs + 3 right drop-offs = 27 nodes
+        assert_eq!(nav.polygons.len(), 27);
+
+        // Each drop-off node (21..27) should have degree 1
+        for dropoff_id in 21..27 {
+            assert_eq!(nav.connections[dropoff_id].len(), 1);
+        }
+
+        let starts = vec![
+            nav.polygons[21].centroid,
+            nav.polygons[22].centroid,
+            nav.polygons[23].centroid,
+            nav.polygons[24].centroid,
+            nav.polygons[25].centroid,
+            nav.polygons[26].centroid,
+        ];
+        let ends = vec![
+            nav.polygons[26].centroid,
+            nav.polygons[25].centroid,
+            nav.polygons[24].centroid,
+            nav.polygons[23].centroid,
+            nav.polygons[22].centroid,
+            nav.polygons[21].centroid,
+        ];
+
+        let mut solver = PIBTOverNavGraph::init(nav.clone());
+        let trajectories = solver.solve(starts.clone(), ends.clone(), 50);
+        assert!(
+            !trajectories.is_empty(),
+            "PIBT should find a valid trajectory on the highway topology"
+        );
+        assert_eq!(trajectories.first().unwrap(), &starts);
+        assert_eq!(trajectories.last().unwrap(), &ends);
+
+        // Verify no vertex or swap conflicts across all timesteps
+        for t in 0..trajectories.len() {
+            for a1 in 0..starts.len() {
+                for a2 in (a1 + 1)..starts.len() {
+                    assert_ne!(
+                        trajectories[t][a1], trajectories[t][a2],
+                        "Vertex conflict at t={t} between agents {a1} and {a2}"
+                    );
+                    if t + 1 < trajectories.len() {
+                        assert!(
+                            !(trajectories[t][a1] == trajectories[t + 1][a2]
+                                && trajectories[t][a2] == trajectories[t + 1][a1]),
+                            "Swap conflict at t={t}->{t1} between agents {a1} and {a2}",
+                            t1 = t + 1
+                        );
+                    }
+                }
+            }
+        }
     }
 }
