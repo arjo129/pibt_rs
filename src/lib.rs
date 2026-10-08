@@ -1,1126 +1,1429 @@
-use std::{
-    cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
-    rc::Rc,
-};
+use ::rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+use macroquad::prelude::*;
+use serde::{Deserialize, Serialize};
 
-pub mod collision_checker;
-pub mod conflicts;
-pub mod hierarchical_cbs_pibt_wrapper;
-pub mod pibt_with_constraints;
-pub mod reservation_system;
+/// Geometry utility: computes the centroid of a 2D polygon from its vertices.
+/// Uses the standard polygon signed area formula; falls back to the vertex average
+/// for degenerate or collinear polygons.
+pub fn compute_polygon_centroid(vertices: &[(f32, f32)]) -> (f32, f32) {
+    let n = vertices.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    if n == 1 {
+        return vertices[0];
+    }
+    if n == 2 {
+        return (
+            (vertices[0].0 + vertices[1].0) * 0.5,
+            (vertices[0].1 + vertices[1].1) * 0.5,
+        );
+    }
 
-/// Vanilla priority based inheritance
-///
-/// This contains a basic PiBT implementation in rust.
-pub struct PiBT {
-    pub grid: Vec<Vec<usize>>,
-    q: Vec<Vec<(i64, i64)>>,
-    dist: Vec<Vec<Vec<i64>>>,
-    other_agents: Vec<Vec<Vec<Option<usize>>>>,
+    let mut signed_area = 0.0f32;
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+
+    for i in 0..n {
+        let (x0, y0) = vertices[i];
+        let (x1, y1) = vertices[(i + 1) % n];
+        let cross = x0 * y1 - x1 * y0;
+        signed_area += cross;
+        cx += (x0 + x1) * cross;
+        cy += (y0 + y1) * cross;
+    }
+
+    signed_area *= 0.5;
+    if signed_area.abs() > 1e-5 {
+        let factor = 1.0 / (6.0 * signed_area);
+        (cx * factor, cy * factor)
+    } else {
+        let sum_x: f32 = vertices.iter().map(|v| v.0).sum();
+        let sum_y: f32 = vertices.iter().map(|v| v.1).sum();
+        (sum_x / n as f32, sum_y / n as f32)
+    }
 }
 
-impl PiBT {
-    pub fn init_empty_world(width: usize, height: usize) -> Self {
-        let grid = vec![vec![0; width]; height];
+/// Squared Euclidean distance from a point `p` to a line segment `ab`.
+pub fn point_to_segment_distance_sq(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-8 {
+        let px = p.0 - a.0;
+        let py = p.1 - a.1;
+        return px * px + py * py;
+    }
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq).clamp(0.0, 1.0);
+    let proj_x = a.0 + t * dx;
+    let proj_y = a.1 + t * dy;
+    let rx = p.0 - proj_x;
+    let ry = p.1 - proj_y;
+    rx * rx + ry * ry
+}
 
-        Self {
-            grid,
-            q: vec![],
-            dist: vec![],
-            other_agents: vec![],
+/// Liang-Barsky segment clipping test against an Axis-Aligned Bounding Box (AABB).
+/// Returns true if the line segment `p1` to `p2` intersects the AABB [min_x, max_x] x [min_y, max_y].
+pub fn segment_intersects_aabb(
+    p1: (f32, f32),
+    p2: (f32, f32),
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+) -> bool {
+    let dx = p2.0 - p1.0;
+    let dy = p2.1 - p1.1;
+
+    let mut t0 = 0.0f32;
+    let mut t1 = 1.0f32;
+
+    let p = [-dx, dx, -dy, dy];
+    let q = [p1.0 - min_x, max_x - p1.0, p1.1 - min_y, max_y - p1.1];
+
+    for i in 0..4 {
+        if p[i].abs() < 1e-8 {
+            if q[i] < 0.0 {
+                return false;
+            }
+        } else {
+            let t = q[i] / p[i];
+            if p[i] < 0.0 {
+                if t > t1 {
+                    return false;
+                }
+                if t > t0 {
+                    t0 = t;
+                }
+            } else {
+                if t < t0 {
+                    return false;
+                }
+                if t < t1 {
+                    t1 = t;
+                }
+            }
+        }
+    }
+    t0 <= t1
+}
+
+/// Robust intersection test between an AABB grid cell and a 2D polygon.
+/// Returns true if the cell touches or overlaps the polygon.
+pub fn cell_intersects_polygon(
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    polygon: &Polygon,
+) -> bool {
+    let boundary = polygon.boundary_vertices();
+    if boundary.is_empty() {
+        return false;
+    }
+
+    // 1. Any polygon vertex inside the cell?
+    for &(vx, vy) in &boundary {
+        if vx >= min_x && vx <= max_x && vy >= min_y && vy <= max_y {
+            return true;
         }
     }
 
-    pub fn init(grid: Vec<Vec<usize>>) -> Self {
-        Self {
-            grid,
-            q: vec![],
-            dist: vec![],
-            other_agents: vec![],
+    // 2. Cell center inside polygon?
+    let center = ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
+    if polygon.contains_point(center) {
+        return true;
+    }
+
+    // 3. Any polygon edge intersects the cell AABB?
+    let n = boundary.len();
+    for i in 0..n {
+        let p1 = boundary[i];
+        let p2 = boundary[(i + 1) % n];
+        if segment_intersects_aabb(p1, p2, min_x, min_y, max_x, max_y) {
+            return true;
         }
+    }
+
+    false
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Polygon {
+    pub vertices: Vec<(f32, f32)>,
+    pub draw_index: Vec<usize>,
+    pub centroid: (f32, f32),
+}
+
+impl Polygon {
+    pub fn new(vertices: Vec<(f32, f32)>, draw_index: Vec<usize>, centroid: (f32, f32)) -> Self {
+        Self {
+            vertices,
+            draw_index,
+            centroid,
+        }
+    }
+
+    /// Construct a polygon from vertices given in perimeter order.
+    /// Centroid and closed draw loop are calculated automatically.
+    pub fn from_vertices(vertices: Vec<(f32, f32)>) -> Self {
+        let n = vertices.len();
+        assert!(n >= 3, "A polygon must have at least 3 vertices");
+        let mut draw_index: Vec<usize> = (0..n).collect();
+        draw_index.push(0);
+        let centroid = compute_polygon_centroid(&vertices);
+        Self {
+            vertices,
+            draw_index,
+            centroid,
+        }
+    }
+
+    /// Construct an axis-aligned rectangle polygon.
+    pub fn rectangle(min_x: f32, min_y: f32, width: f32, height: f32) -> Self {
+        let centroid = (min_x + width * 0.5, min_y + height * 0.5);
+        Self {
+            centroid,
+            vertices: vec![
+                (min_x, min_y),
+                (min_x, min_y + height),
+                (min_x + width, min_y + height),
+                (min_x + width, min_y),
+            ],
+            draw_index: vec![0, 1, 2, 3, 0],
+        }
+    }
+
+    /// Returns the ordered perimeter vertices of the polygon.
+    pub fn boundary_vertices(&self) -> Vec<(f32, f32)> {
+        if self.draw_index.is_empty() {
+            return self.vertices.clone();
+        }
+        let mut indices = self.draw_index.as_slice();
+        if indices.len() > 1 && indices.first() == indices.last() {
+            indices = &indices[..indices.len() - 1];
+        }
+        indices
+            .iter()
+            .filter_map(|&i| self.vertices.get(i).copied())
+            .collect()
+    }
+
+    /// Returns the axis-aligned bounding box ((min_x, min_y), (max_x, max_y)).
+    pub fn aabb(&self) -> ((f32, f32), (f32, f32)) {
+        let boundary = self.boundary_vertices();
+        if boundary.is_empty() {
+            return (self.centroid, self.centroid);
+        }
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for &(x, y) in &boundary {
+            if x < min_x {
+                min_x = x;
+            }
+            if y < min_y {
+                min_y = y;
+            }
+            if x > max_x {
+                max_x = x;
+            }
+            if y > max_y {
+                max_y = y;
+            }
+        }
+        ((min_x, min_y), (max_x, max_y))
+    }
+
+    /// Point-in-polygon test using ray casting (even-odd rule).
+    pub fn contains_point(&self, p: (f32, f32)) -> bool {
+        let ((min_x, min_y), (max_x, max_y)) = self.aabb();
+        if p.0 < min_x - 1e-4 || p.0 > max_x + 1e-4 || p.1 < min_y - 1e-4 || p.1 > max_y + 1e-4 {
+            return false;
+        }
+
+        let b = self.boundary_vertices();
+        if b.len() < 3 {
+            return false;
+        }
+        let mut inside = false;
+        let n = b.len();
+        let mut j = n - 1;
+        for i in 0..n {
+            let (xi, yi) = b[i];
+            let (xj, yj) = b[j];
+            let intersect =
+                ((yi > p.1) != (yj > p.1)) && (p.0 < (xj - xi) * (p.1 - yi) / (yj - yi) + xi);
+            if intersect {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    }
+
+    /// Distance from point `p` to the polygon perimeter.
+    pub fn distance_to_boundary(&self, p: (f32, f32)) -> f32 {
+        let b = self.boundary_vertices();
+        if b.is_empty() {
+            return f32::MAX;
+        }
+        if b.len() == 1 {
+            let dx = p.0 - b[0].0;
+            let dy = p.1 - b[0].1;
+            return (dx * dx + dy * dy).sqrt();
+        }
+        let mut min_d_sq = f32::MAX;
+        let n = b.len();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let d_sq = point_to_segment_distance_sq(p, b[i], b[j]);
+            if d_sq < min_d_sq {
+                min_d_sq = d_sq;
+            }
+        }
+        min_d_sq.sqrt()
+    }
+
+    pub fn draw(&self) {
+        self.draw_styled(RED, 1.0);
+    }
+
+    pub fn draw_styled(&self, color: Color, thickness: f32) {
+        for i in 0..self.draw_index.len().saturating_sub(1) {
+            let start = self.vertices[self.draw_index[i]];
+            let end = self.vertices[self.draw_index[i + 1]];
+            draw_line(start.0, start.1, end.0, end.1, thickness, color);
+        }
+    }
+
+    pub fn draw_filled(&self, color: Color) {
+        let b = self.boundary_vertices();
+        if b.len() < 3 {
+            return;
+        }
+        for i in 1..b.len() - 1 {
+            draw_triangle(
+                Vec2::new(b[0].0, b[0].1),
+                Vec2::new(b[i].0, b[i].1),
+                Vec2::new(b[i + 1].0, b[i + 1].1),
+                color,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GuidePreference {
+    FORWARD,
+    BACKWARD,
+    NONE,
+}
+
+impl GuidePreference {
+    pub fn opposite(&self) -> Self {
+        match self {
+            Self::FORWARD => Self::BACKWARD,
+            Self::BACKWARD => Self::FORWARD,
+            Self::NONE => Self::NONE,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NavGraph {
+    pub polygons: Vec<Polygon>,
+    pub connections: Vec<Vec<(usize, GuidePreference)>>,
+}
+
+impl NavGraph {
+    pub fn add_node(&mut self, polygon: Polygon) -> usize {
+        self.polygons.push(polygon);
+        self.connections.push(vec![]);
+        self.polygons.len() - 1
+    }
+
+    pub fn add_rectangle(&mut self, min_x: f32, min_y: f32, width: f32, height: f32) -> usize {
+        self.add_node(Polygon::rectangle(min_x, min_y, width, height))
+    }
+
+    pub fn add_polygon_from_vertices(&mut self, vertices: Vec<(f32, f32)>) -> usize {
+        self.add_node(Polygon::from_vertices(vertices))
+    }
+
+    /// Note: We DO NOT check for duplicates
+    pub fn add_edge(&mut self, n1: usize, n2: usize, guide: GuidePreference) {
+        self.connections[n1].push((n2, guide));
+        self.connections[n2].push((n1, guide.opposite()));
+    }
+
+    /// Going back: maps a specific polygon index to its centroid (x, y) location.
+    pub fn polygon_centroid(&self, polygon_id: usize) -> Option<(f32, f32)> {
+        self.polygons.get(polygon_id).map(|p| p.centroid)
+    }
+
+    /// Alias for going back from polygon to (x, y) location.
+    pub fn polygon_to_point(&self, polygon_id: usize) -> Option<(f32, f32)> {
+        self.polygon_centroid(polygon_id)
+    }
+
+    /// Returns the combined bounding box of all polygons in the NavGraph.
+    pub fn bounds(&self) -> Option<((f32, f32), (f32, f32))> {
+        if self.polygons.is_empty() {
+            return None;
+        }
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+
+        for p in &self.polygons {
+            let ((p_min_x, p_min_y), (p_max_x, p_max_y)) = p.aabb();
+            if p_min_x < min_x {
+                min_x = p_min_x;
+            }
+            if p_min_y < min_y {
+                min_y = p_min_y;
+            }
+            if p_max_x > max_x {
+                max_x = p_max_x;
+            }
+            if p_max_y > max_y {
+                max_y = p_max_y;
+            }
+        }
+
+        Some(((min_x, min_y), (max_x, max_y)))
+    }
+
+    /// Builds a fixed-resolution spatial bitmap grid rasterizing all polygons in this NavGraph.
+    pub fn build_bitmap_grid(&self, resolution: f32) -> PolygonBitmapGrid {
+        PolygonBitmapGrid::from_nav_graph(self, resolution)
+    }
+
+    pub fn draw(&self) {
+        self.draw_styled(RED, 1.0, false);
+    }
+
+    pub fn draw_styled(&self, wire_color: Color, thickness: f32, draw_connections: bool) {
+        if draw_connections {
+            for (u, neighbors) in self.connections.iter().enumerate() {
+                let cu = self.polygons[u].centroid;
+                for &(v, _) in neighbors {
+                    if u < v {
+                        let cv = self.polygons[v].centroid;
+                        draw_line(cu.0, cu.1, cv.0, cv.1, 1.5, DARKGRAY);
+                    }
+                }
+            }
+        }
+        for polygon in &self.polygons {
+            polygon.draw_styled(wire_color, thickness);
+        }
+    }
+}
+
+/// A fixed-resolution bitmap spatial grid that rasterizes polygons from a NavGraph.
+///
+/// Provides O(1) lookup to map arbitrary (x, y) continuous locations on the NavGraph
+/// to specific polygon IDs, and maps polygon IDs back to (x, y) centroids.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PolygonBitmapGrid {
+    /// World coordinate origin corresponding to grid cell (0, 0).
+    pub origin: (f32, f32),
+    /// World-space width and height of each discrete grid cell (fixed resolution).
+    pub resolution: f32,
+    /// Number of grid columns along the X axis.
+    pub width: usize,
+    /// Number of grid rows along the Y axis.
+    pub height: usize,
+    /// Flat 2D array of cells (index = `gy * width + gx`).
+    /// Each cell stores the IDs of all polygons that intersect/overlap that cell.
+    pub cells: Vec<Vec<usize>>,
+}
+
+impl PolygonBitmapGrid {
+    /// Creates an empty bitmap grid with the given origin, resolution, and dimensions.
+    pub fn new(origin: (f32, f32), width: usize, height: usize, resolution: f32) -> Self {
+        assert!(resolution > 0.0, "Resolution must be positive");
+        let total_cells = width * height;
+        Self {
+            origin,
+            resolution,
+            width,
+            height,
+            cells: vec![Vec::new(); total_cells],
+        }
+    }
+
+    /// Automatically constructs and rasterizes a bitmap grid sized to cover the entire `NavGraph`.
+    pub fn from_nav_graph(nav: &NavGraph, resolution: f32) -> Self {
+        Self::from_nav_graph_with_padding(nav, resolution, 0.0)
+    }
+
+    /// Constructs and rasterizes a bitmap grid covering the `NavGraph` with optional world padding.
+    pub fn from_nav_graph_with_padding(nav: &NavGraph, resolution: f32, padding: f32) -> Self {
+        assert!(resolution > 0.0, "Resolution must be positive");
+        let Some(((min_x, min_y), (max_x, max_y))) = nav.bounds() else {
+            return Self::new((0.0, 0.0), 0, 0, resolution);
+        };
+
+        let origin_x = min_x - padding;
+        let origin_y = min_y - padding;
+        let total_w = (max_x + padding) - origin_x;
+        let total_h = (max_y + padding) - origin_y;
+
+        // +1 margin ensures points lying exactly on the upper boundary fall within valid indices
+        let width = ((total_w / resolution).ceil() as usize + 1).max(1);
+        let height = ((total_h / resolution).ceil() as usize + 1).max(1);
+
+        let mut grid = Self::new((origin_x, origin_y), width, height, resolution);
+        grid.rasterize_nav_graph(nav);
+        grid
+    }
+
+    /// Clears all rasterized polygon references from all grid cells.
+    pub fn clear(&mut self) {
+        for cell in &mut self.cells {
+            cell.clear();
+        }
+    }
+
+    /// Rasterizes all polygons of a NavGraph into this bitmap grid.
+    pub fn rasterize_nav_graph(&mut self, nav: &NavGraph) {
+        for (poly_id, polygon) in nav.polygons.iter().enumerate() {
+            self.rasterize_polygon(poly_id, polygon);
+        }
+    }
+
+    /// Rasterizes a single polygon into the bitmap grid cells it overlaps.
+    pub fn rasterize_polygon(&mut self, poly_id: usize, polygon: &Polygon) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+
+        let ((min_x, min_y), (max_x, max_y)) = polygon.aabb();
+
+        // Convert world-space AABB to grid coordinate bounds, clamped to grid dimensions
+        let min_gx = (((min_x - self.origin.0) / self.resolution).floor().max(0.0) as usize)
+            .min(self.width.saturating_sub(1));
+        let max_gx = (((max_x - self.origin.0) / self.resolution).floor().max(0.0) as usize)
+            .min(self.width.saturating_sub(1));
+        let min_gy = (((min_y - self.origin.1) / self.resolution).floor().max(0.0) as usize)
+            .min(self.height.saturating_sub(1));
+        let max_gy = (((max_y - self.origin.1) / self.resolution).floor().max(0.0) as usize)
+            .min(self.height.saturating_sub(1));
+
+        for gy in min_gy..=max_gy {
+            let cell_min_y = self.origin.1 + gy as f32 * self.resolution;
+            let cell_max_y = cell_min_y + self.resolution;
+            for gx in min_gx..=max_gx {
+                let cell_min_x = self.origin.0 + gx as f32 * self.resolution;
+                let cell_max_x = cell_min_x + self.resolution;
+
+                if cell_intersects_polygon(cell_min_x, cell_min_y, cell_max_x, cell_max_y, polygon)
+                {
+                    let idx = gy * self.width + gx;
+                    if !self.cells[idx].contains(&poly_id) {
+                        self.cells[idx].push(poly_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Converts world coordinates (x, y) to discrete grid cell indices (gx, gy).
+    pub fn world_to_grid(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let gx_f = (x - self.origin.0) / self.resolution;
+        let gy_f = (y - self.origin.1) / self.resolution;
+        if gx_f < 0.0 || gy_f < 0.0 {
+            return None;
+        }
+        let gx = gx_f.floor() as usize;
+        let gy = gy_f.floor() as usize;
+        if gx < self.width && gy < self.height {
+            Some((gx, gy))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the world-space center coordinate of grid cell (gx, gy).
+    pub fn grid_to_world_center(&self, gx: usize, gy: usize) -> (f32, f32) {
+        (
+            self.origin.0 + (gx as f32 + 0.5) * self.resolution,
+            self.origin.1 + (gy as f32 + 0.5) * self.resolution,
+        )
+    }
+
+    /// Returns the bounding box ((min_x, min_y), (max_x, max_y)) of cell (gx, gy).
+    pub fn grid_to_cell_bounds(&self, gx: usize, gy: usize) -> ((f32, f32), (f32, f32)) {
+        let min_x = self.origin.0 + gx as f32 * self.resolution;
+        let min_y = self.origin.1 + gy as f32 * self.resolution;
+        (
+            (min_x, min_y),
+            (min_x + self.resolution, min_y + self.resolution),
+        )
+    }
+
+    /// Returns the slice of rasterized polygon IDs at grid cell (gx, gy).
+    pub fn get_cell(&self, gx: usize, gy: usize) -> &[usize] {
+        if gx < self.width && gy < self.height {
+            &self.cells[gy * self.width + gx]
+        } else {
+            &[]
+        }
+    }
+
+    /// Returns the slice of rasterized polygon candidate IDs at arbitrary world coordinates (x, y).
+    pub fn get_raster_polygons_at(&self, x: f32, y: f32) -> &[usize] {
+        match self.world_to_grid(x, y) {
+            Some((gx, gy)) => self.get_cell(gx, gy),
+            None => &[],
+        }
+    }
+
+    /// Core forward mapping: goes from an arbitrary (x, y) location on the NavGraph
+    /// to the specific polygon ID containing that location.
+    ///
+    /// Runs in O(1) time using the raster bitmap cell to retrieve candidate polygons,
+    /// then performs an exact point-in-polygon test among candidates.
+    pub fn get_polygon_at(&self, x: f32, y: f32, nav: &NavGraph) -> Option<usize> {
+        let (gx, gy) = self.world_to_grid(x, y)?;
+        let idx = gy * self.width + gx;
+        let candidates = &self.cells[idx];
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Fast path: single candidate covering this cell
+        if candidates.len() == 1 {
+            let poly_id = candidates[0];
+            if let Some(poly) = nav.polygons.get(poly_id) {
+                if poly.contains_point((x, y)) || poly.distance_to_boundary((x, y)) < 1e-3 {
+                    return Some(poly_id);
+                }
+            }
+            return None;
+        }
+
+        // Multiple candidates (boundary cell): check strict containment
+        for &poly_id in candidates {
+            if let Some(poly) = nav.polygons.get(poly_id) {
+                if poly.contains_point((x, y)) {
+                    return Some(poly_id);
+                }
+            }
+        }
+
+        // Floating-point edge boundary fallback: select the candidate whose perimeter
+        // is closest to the query point within tolerance.
+        let mut best_candidate = None;
+        let mut best_dist = f32::MAX;
+        for &poly_id in candidates {
+            if let Some(poly) = nav.polygons.get(poly_id) {
+                let dist = poly.distance_to_boundary((x, y));
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_candidate = Some(poly_id);
+                }
+            }
+        }
+
+        if best_dist < 1e-2 {
+            best_candidate
+        } else {
+            None
+        }
+    }
+
+    /// Core reverse mapping: goes from a specific polygon ID back to its (x, y) centroid.
+    pub fn polygon_to_point(&self, nav: &NavGraph, polygon_id: usize) -> Option<(f32, f32)> {
+        nav.polygon_centroid(polygon_id)
+    }
+
+    /// Draws wireframe grid lines of the bitmap raster cells.
+    pub fn draw_debug_grid(&self, color: Color) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        let max_x = self.origin.0 + self.width as f32 * self.resolution;
+        let max_y = self.origin.1 + self.height as f32 * self.resolution;
+
+        for gx in 0..=self.width {
+            let x = self.origin.0 + gx as f32 * self.resolution;
+            draw_line(x, self.origin.1, x, max_y, 0.5, color);
+        }
+        for gy in 0..=self.height {
+            let y = self.origin.1 + gy as f32 * self.resolution;
+            draw_line(self.origin.0, y, max_x, y, 0.5, color);
+        }
+    }
+
+    /// Fills a specific raster cell with color.
+    pub fn draw_cell(&self, gx: usize, gy: usize, fill_color: Color) {
+        if gx < self.width && gy < self.height {
+            let x = self.origin.0 + gx as f32 * self.resolution;
+            let y = self.origin.1 + gy as f32 * self.resolution;
+            draw_rectangle(x, y, self.resolution, self.resolution, fill_color);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistanceMatrix {
+    pub matrix: Vec<Vec<i32>>,
+}
+
+impl DistanceMatrix {
+    pub fn from(nav_graph: &NavGraph) -> Self {
+        let n = nav_graph.polygons.len();
+        let mut matrix = vec![vec![-1; n]; n];
+        let mut q = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let row = &mut matrix[i];
+            row[i] = 0;
+            q.clear();
+            q.push(i);
+            let mut head = 0;
+
+            while head < q.len() {
+                let node = q[head];
+                head += 1;
+                let dist = row[node];
+
+                for &(other, _) in &nav_graph.connections[node] {
+                    if row[other] == -1 {
+                        row[other] = dist + 1;
+                        q.push(other);
+                    }
+                }
+            }
+        }
+
+        Self { matrix }
+    }
+}
+
+impl From<&NavGraph> for DistanceMatrix {
+    fn from(nav_graph: &NavGraph) -> Self {
+        Self::from(nav_graph)
+    }
+}
+
+pub fn simple_square(centroid: (f32, f32), size: f32) -> Polygon {
+    Polygon {
+        centroid,
+        vertices: vec![
+            (centroid.0 - size / 2.0, centroid.1 - size / 2.0),
+            (centroid.0 - size / 2.0, centroid.1 + size / 2.0),
+            (centroid.0 + size / 2.0, centroid.1 - size / 2.0),
+            (centroid.0 + size / 2.0, centroid.1 + size / 2.0),
+        ],
+        draw_index: vec![0, 1, 3, 2, 0],
+    }
+}
+
+pub fn generate_grid(start: (f32, f32), grid_size: f32, width: usize, height: usize) -> NavGraph {
+    let mut nav = NavGraph::default();
+    if width == 0 || height == 0 {
+        return nav;
+    }
+    let (start_x, start_y) = start;
+
+    for i in 0..width {
+        for j in 0..height {
+            let centroid = (
+                start_x + (i as f32 + 0.5) * grid_size,
+                start_y + (j as f32 + 0.5) * grid_size,
+            );
+            nav.add_node(simple_square(centroid, grid_size));
+        }
+    }
+
+    let node_id = |i: usize, j: usize| i * height + j;
+
+    for i in 0..width {
+        for j in 0..height {
+            let current = node_id(i, j);
+            if i + 1 < width {
+                nav.add_edge(current, node_id(i + 1, j), GuidePreference::NONE);
+            }
+            if j + 1 < height {
+                nav.add_edge(current, node_id(i, j + 1), GuidePreference::NONE);
+            }
+        }
+    }
+    nav
+}
+
+/// Generates a 3x7 center highway with 3 drop-off points on either side (left and right),
+/// using wider outer lanes and larger drop-off bays to demonstrate varied polygon sizes.
+///
+/// Layout:
+/// - Nodes `0..21`: 3 columns (`i in 0..3`) x 7 rows (`j in 0..7`) center highway (`i * 7 + j`).
+///   Outer lanes (`i = 0, 2`) are wider (`1.3 * grid_size`) than the center lane (`1.0 * grid_size`).
+/// - Nodes `21..24`: 3 left-side drop-off bays (`1.6 * grid_size` x `1.2 * grid_size`) at rows `j = 1, 3, 5`, connected to `(0, j)`.
+/// - Nodes `24..27`: 3 right-side drop-off bays (`1.6 * grid_size` x `1.2 * grid_size`) at rows `j = 1, 3, 5`, connected to `(2, j)`.
+pub fn generate_highway_with_dropoffs(start: (f32, f32), grid_size: f32) -> NavGraph {
+    let mut nav = NavGraph::default();
+    let width = 3;
+    let height = 7;
+    let (start_x, start_y) = start;
+
+    let lane_widths = [1.3 * grid_size, grid_size, 1.3 * grid_size];
+    let lane_x_offsets = [
+        start_x,
+        start_x + lane_widths[0],
+        start_x + lane_widths[0] + lane_widths[1],
+    ];
+    let total_highway_width: f32 = lane_widths.iter().sum();
+
+    for i in 0..width {
+        let min_x = lane_x_offsets[i];
+        let w = lane_widths[i];
+        for j in 0..height {
+            let min_y = start_y + j as f32 * grid_size;
+            nav.add_rectangle(min_x, min_y, w, grid_size);
+        }
+    }
+
+    let node_id = |i: usize, j: usize| i * height + j;
+
+    for i in 0..width {
+        for j in 0..height {
+            let current = node_id(i, j);
+            if i + 1 < width {
+                nav.add_edge(current, node_id(i + 1, j), GuidePreference::NONE);
+            }
+            if j + 1 < height {
+                nav.add_edge(current, node_id(i, j + 1), GuidePreference::NONE);
+            }
+        }
+    }
+
+    let dropoff_rows = [1usize, 3, 5];
+    let dropoff_w = 1.6 * grid_size;
+    let dropoff_h = 1.2 * grid_size;
+
+    // 3 wider drop-off bays on the left side (connected to column 0)
+    for &j in &dropoff_rows {
+        let row_center_y = start_y + (j as f32 + 0.5) * grid_size;
+        let min_x = start_x - dropoff_w;
+        let min_y = row_center_y - 0.5 * dropoff_h;
+        let dropoff_id = nav.add_rectangle(min_x, min_y, dropoff_w, dropoff_h);
+        nav.add_edge(dropoff_id, node_id(0, j), GuidePreference::NONE);
+    }
+
+    // 3 wider drop-off bays on the right side (connected to column 2)
+    for &j in &dropoff_rows {
+        let row_center_y = start_y + (j as f32 + 0.5) * grid_size;
+        let min_x = start_x + total_highway_width;
+        let min_y = row_center_y - 0.5 * dropoff_h;
+        let dropoff_id = nav.add_rectangle(min_x, min_y, dropoff_w, dropoff_h);
+        nav.add_edge(dropoff_id, node_id(width - 1, j), GuidePreference::NONE);
+    }
+
+    nav
+}
+
+/// Generates a realistic non-uniform nav-mesh graph with variable-sized rooms,
+/// narrow corridors, and an angled triangular foyer.
+pub fn generate_non_uniform_navmesh() -> NavGraph {
+    let mut nav = NavGraph::default();
+
+    // Node 0: Large Central Hall (120 x 80)
+    let n0 = nav.add_rectangle(180.0, 140.0, 140.0, 90.0);
+
+    // Node 1: West Room (70 x 70)
+    let n1 = nav.add_rectangle(60.0, 150.0, 70.0, 70.0);
+
+    // Node 2: West Connecting Corridor (50 x 30)
+    let n2 = nav.add_rectangle(130.0, 170.0, 50.0, 30.0);
+
+    // Node 3: North Office (90 x 50)
+    let n3 = nav.add_rectangle(205.0, 50.0, 90.0, 50.0);
+
+    // Node 4: North Corridor (30 x 40)
+    let n4 = nav.add_rectangle(235.0, 100.0, 30.0, 40.0);
+
+    // Node 5: East Corridor (60 x 30)
+    let n5 = nav.add_rectangle(320.0, 170.0, 60.0, 30.0);
+
+    // Node 6: East Wing (80 x 110)
+    let n6 = nav.add_rectangle(380.0, 130.0, 80.0, 110.0);
+
+    // Node 7: South Triangular Atrium / Foyer
+    let n7 = nav.add_polygon_from_vertices(vec![(210.0, 230.0), (290.0, 230.0), (250.0, 310.0)]);
+
+    // Connect the non-uniform navmesh nodes
+    nav.add_edge(n1, n2, GuidePreference::NONE);
+    nav.add_edge(n2, n0, GuidePreference::NONE);
+    nav.add_edge(n3, n4, GuidePreference::NONE);
+    nav.add_edge(n4, n0, GuidePreference::NONE);
+    nav.add_edge(n0, n5, GuidePreference::NONE);
+    nav.add_edge(n5, n6, GuidePreference::NONE);
+    nav.add_edge(n0, n7, GuidePreference::NONE);
+
+    nav
+}
+
+pub struct PIBTOverNavGraph {
+    pub nav_graph: NavGraph,
+    pub q: Vec<Vec<Option<usize>>>,
+    // TODO(arjoc): Only compute distance matrix for agents
+    pub distance_matrix: DistanceMatrix,
+    rng: StdRng,
+    // TODO(arjoc): Remove this
+    ends: Vec<usize>,
+    occupied_now: Vec<Option<usize>>,
+    occupied_nxt: Vec<Option<usize>>,
+}
+
+impl PIBTOverNavGraph {
+    pub fn init(nav_graph: NavGraph) -> Self {
+        let distance_matrix = DistanceMatrix::from(&nav_graph);
+        let nav_graph_len = nav_graph.polygons.len();
+        Self {
+            nav_graph,
+            distance_matrix,
+            q: vec![],
+            rng: StdRng::seed_from_u64(42),
+            ends: vec![], //hacky remove this once we fix the Distance Matrix API
+            occupied_now: vec![None; nav_graph_len],
+            occupied_nxt: vec![None; nav_graph_len],
+        }
+    }
+
+    fn pibt(&mut self, agent: usize, time: usize) -> bool {
+        let Some(q_from) = self.q[time][agent] else {
+            // SAFETY: pibt is a private API that should only be called from within this file
+            // Before we call it we already populate all positions for the agent at timestap t.
+            panic!("Accessed an agent wuth no position");
+        };
+        let mut neighbors = self.nav_graph.connections[q_from].clone();
+        let goal_node = self.ends[agent];
+        if q_from == goal_node {
+            neighbors.push((q_from, GuidePreference::NONE));
+        }
+        neighbors.shuffle(&mut self.rng);
+
+        neighbors.sort_by(|pos1, pos2| {
+            // Get agent's goal
+            let dist1 = self.distance_matrix.matrix[pos1.0][goal_node];
+            let dist2 = self.distance_matrix.matrix[pos2.0][goal_node];
+            dist1.cmp(&dist2)
+        });
+
+        for (node_id, _) in neighbors {
+            // vertex conflict
+            if self.occupied_nxt[node_id] != None {
+                continue;
+            }
+
+            let agent_to_move_out = self.occupied_now[node_id];
+
+            //swap conflicts
+            if let Some(agent_to_move_out) = agent_to_move_out {
+                if agent_to_move_out != agent
+                    && self.q[time][agent] == self.q[time + 1][agent_to_move_out]
+                {
+                    continue;
+                }
+            }
+
+            // Reserve next location
+            self.occupied_nxt[node_id] = Some(agent);
+            self.q[time + 1][agent] = Some(node_id);
+
+            if let Some(agent_to_move_out) = agent_to_move_out {
+                if agent_to_move_out != agent && self.q[time + 1][agent_to_move_out] == None {
+                    if !self.pibt(agent_to_move_out, time) {
+                        self.q[time + 1][agent] = None;
+                        continue;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        self.occupied_nxt[q_from] = Some(agent);
+        self.q[time + 1][agent] = Some(q_from);
+        false
+    }
+
+    fn is_solution(&self, t: usize) -> bool {
+        if self.q[t].len() != self.ends.len() {
+            return false;
+        }
+
+        for item in 0..self.q[t].len() {
+            let Some(val) = self.q[t][item] else {
+                return false;
+            };
+
+            if val != self.ends[item] {
+                return false;
+            }
+        }
+
+        true
     }
 
     pub fn solve(
         &mut self,
-        starts: &Vec<(usize, usize)>,
-        ends: &Vec<(usize, usize)>,
+        starts: Vec<(f32, f32)>,
+        ends: Vec<(f32, f32)>,
         max_time: usize,
-    ) -> Result<Vec<Vec<(i64, i64)>>, ()> {
-        let mut priorities = vec![];
-        // SSSP for individual agents
-        for agent in 0..starts.len() {
-            self.dist
-                .push(vec![vec![-1; self.grid[0].len()]; self.grid.len()]);
+    ) -> Vec<Vec<(f32, f32)>> {
+        let mut agents: Vec<_> = (0..starts.len()).collect();
+        let mut final_trajectory = vec![];
 
-            let (x, y) = ends[agent];
+        let bitmap = self.nav_graph.build_bitmap_grid(1.0);
 
-            self.dist[agent][x][y] = 0;
-            let mut queue: VecDeque<(usize, usize, usize)> = VecDeque::new();
-
-            queue.push_back((x, y, 0));
-
-            while let Some((x, y, dist)) = queue.pop_front() {
-                let neighbor = [(1, 0), (0, 1), (0, -1), (-1, 0)]
-                    .iter()
-                    .map(|m| (x as i64 + m.0, y as i64 + m.1))
-                    .filter(|(x, y)| {
-                        *x >= 0
-                            && *y >= 0
-                            && *x < self.grid.len() as i64
-                            && *y < self.grid[0].len() as i64
-                            && self.grid[*x as usize][*y as usize] == 0
-                    })
-                    .map(|(x, y)| (x as usize, y as usize));
-                for (x, y) in neighbor.into_iter() {
-                    if self.dist[agent][x][y] != -1 {
-                        continue;
-                    }
-                    self.dist[agent][x][y] = (dist + 1) as i64;
-                    queue.push_back((x, y, dist + 1));
-                }
-            }
-            priorities.push(self.dist[agent][starts[agent].0][starts[agent].1]);
-        }
-        println!("Calculated goal matrix");
-
-        // Initialize grids
-        self.other_agents =
-            vec![vec![vec![None; self.grid[0].len()]; self.grid.len()]; max_time + 1];
-        self.q = vec![vec![(-1, -1); starts.len()]; max_time + 1];
-
-        for agent in 0..starts.len() {
-            self.q[0][agent] = (starts[agent].0 as i64, starts[agent].1 as i64);
-            self.other_agents[0][starts[agent].0][starts[agent].1] = Some(agent);
-        }
-        // Iteratively solve the problem.
-        for t in 1..max_time - 1 {
-            // PiBT Logic
-            let mut agents: Vec<_> = (0..starts.len()).collect();
-            agents.sort_by(|p, q| priorities[*p].cmp(&priorities[*q]));
-            for agent in agents {
-                if self.q[t][agent] == (-1, -1) {
-                    self.pibt(agent, t - 1);
-                }
-            }
-
-            // Completion check and priority update
-            let mut complete = true;
-            for agent in 0..starts.len() {
-                if self.q[t][agent] != (ends[agent].0 as i64, ends[agent].1 as i64) {
-                    priorities[agent] += 1;
-                    complete = false;
-                } else {
-                    priorities[agent] -= priorities[agent];
-                }
-            }
-
-            if complete {
-                self.q.truncate(max_time - t);
-                return Ok(self.q.clone());
-            }
-        }
-
-        println!("{:?}", self.q);
-        return Err(());
-    }
-
-    fn ssp_heuristic(&self, goal: &(i64, i64), for_agent: usize) -> i64 {
-        self.dist[for_agent][goal.0 as usize][goal.1 as usize]
-    }
-
-    /// Implements vanilla PiBT for high speed multi-robot planning.
-    /// - agent: usize
-    /// - time: usize
-    fn pibt(&mut self, agent: usize, time: usize) {
-        // (Agent, items to reserve in stack)
-        let mut stack: Vec<(usize, Vec<(usize, usize, usize)>)> = vec![(agent, vec![])];
-
-        while let Some((agent, to_reserve)) = stack.pop() {
-            // Apply stack changes
-            for (agent, x, y) in &to_reserve {
-                self.other_agents[time + 1][*x][*y] = Some(*agent);
-                self.q[time + 1][*agent] = (*x as i64, *y as i64);
-            }
-
-            // Get neighbours
-            let q_from = self.q[time][agent];
-            let mut neighbor: smallvec::SmallVec<[(i64, i64); 4]> =
-                [(1, 0), (0, 1), (0, -1), (-1, 0)]
-                    .iter()
-                    .map(|m| (q_from.0 + m.0, q_from.1 + m.1))
-                    .filter(|(x, y)| {
-                        *x >= 0
-                            && *y >= 0
-                            && *x < self.grid.len() as i64
-                            && *y < self.grid[0].len() as i64
-                            && self.grid[(*x as usize)][(*y as usize)] == 0
-                            && self.ssp_heuristic(&(*x, *y), agent) >= 0
-                    })
-                    .collect();
-            neighbor.sort_by(|pos1, pos2| {
-                let dist1 = self.ssp_heuristic(pos1, agent);
-                let dist2 = self.ssp_heuristic(pos2, agent);
-                dist1.cmp(&dist2)
-            });
-
-            let mut found_solution = false;
-            for (x, y) in neighbor {
-                // Crustacean stuff
-                let x = x as usize;
-                let y = y as usize;
-                // If occupied skip
-                if self.other_agents[time + 1][x][y].is_some() {
-                    continue;
-                }
-                // Swap conflict prevention
-                if let Some(agent_to_check) = self.other_agents[time][x][y] {
-                    // There is an agent on the destination square at the current time
-                    let other_agents_destination = self.q[time + 1][agent_to_check];
-                    if other_agents_destination == q_from {
-                        // Swap Conflict
-                        continue;
-                    }
-
-                    if other_agents_destination.0 < 0 && other_agents_destination.1 < 0 {
-                        // inherit the priority of this agent
-                        let mut to_reserve = to_reserve.clone();
-                        to_reserve.push((agent, x, y));
-                        stack.push((agent_to_check, to_reserve));
-                    } else {
-                        self.other_agents[time + 1][x][y] = Some(agent);
-                        self.q[time + 1][agent] = (x as i64, y as i64);
-                        // Agent already plans to yeet
-                        found_solution = true;
-                        break;
-                    }
-                } else {
-                    self.other_agents[time + 1][x][y] = Some(agent);
-                    self.q[time + 1][agent] = (x as i64, y as i64);
-                    found_solution = true;
-                    break;
-                }
-            }
-
-            if !found_solution {
-                // TODO(arjo): Backtrack
-                for (agent, x, y) in &to_reserve {
-                    self.other_agents[time + 1][*x][*y] = None;
-                    self.q[time + 1][*agent] = (-1, -1);
-                }
-            }
-        }
-    }
-}
-
-pub fn parse_grid(file_name: &str) -> Vec<Vec<usize>> {
-    let content = std::fs::read_to_string(file_name).expect("Failed to read the file");
-    let mut grid = Vec::new();
-    let mut lines = content.lines();
-
-    // Skip the header lines
-    lines.next(); // type octile
-    lines.next(); // height
-    lines.next(); // width
-    lines.next(); // map
-
-    for line in lines {
-        let mut row = Vec::new();
-        for char in line.chars() {
-            match char {
-                '.' => row.push(0),
-                '@' => row.push(1),
-                _ => continue,
-            }
-        }
-        if !row.is_empty() {
-            grid.push(row);
-        }
-    }
-    grid
-}
-
-pub fn parse_grid_with_scale(file_name: &str, scale: usize) -> Vec<Vec<usize>> {
-    let content = std::fs::read_to_string(file_name).expect("Failed to read the file");
-    let mut scaled_grid = Vec::new(); // Changed name for clarity
-    let mut lines = content.lines();
-
-    // Skip the header lines
-    lines.next(); // type octile
-    lines.next(); // height
-    lines.next(); // width
-    lines.next(); // map
-
-    // Check if scale is valid to prevent infinite loops or panics
-    let final_scale = if scale == 0 { 1 } else { scale };
-
-    for line in lines {
-        let mut original_row = Vec::new();
-        for char in line.chars() {
-            match char {
-                '.' => original_row.push(0),
-                '@' => original_row.push(1),
-                _ => continue,
-            }
-        }
-
-        if original_row.is_empty() {
-            continue;
-        }
-
-        // 1. Scale the row horizontally
-        let mut scaled_row = Vec::new();
-        for &cell_value in original_row.iter() {
-            // Repeat the cell value `final_scale` times
-            for _ in 0..final_scale {
-                scaled_row.push(cell_value);
-            }
-        }
-
-        // 2. Scale the row vertically
-        // Repeat the entire scaled row `final_scale` times
-        for _ in 0..final_scale {
-            scaled_grid.push(scaled_row.clone()); // Use clone to push a copy of the row
-        }
-    }
-
-    scaled_grid
-}
-
-pub fn parse_scen(file_name: &str) -> Result<Vec<Vec<(usize, usize)>>, std::num::ParseIntError> {
-    let content = std::fs::read_to_string(file_name).expect("Failed to read the file");
-    let mut lines = content.lines();
-
-    lines.next();
-
-    let mut starts = vec![];
-    let mut ends = vec![];
-    for line in lines {
-        let pts: Vec<_> = line.split_ascii_whitespace().collect();
-
-        let start_x: usize = pts[4].parse()?;
-        let start_y: usize = pts[5].parse()?;
-        let end_x: usize = pts[6].parse()?;
-        let end_y: usize = pts[7].parse()?;
-
-        starts.push((start_x, start_y));
-        ends.push((end_x, end_y));
-    }
-    Ok(vec![starts, ends])
-}
-
-use crate::collision_checker::MultiGridCollisionChecker;
-
-use crate::reservation_system::{HeterogenousReservationSystem, HeterogenousTrajectory};
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-struct ProposedPath {
-    path: Vec<(usize, usize, usize)>,
-    need_to_moveout: Vec<usize>,
-}
-
-/// This is used to implement pathfinding given the WinPiBT
-/// concept of "Disentangled" paths.
-struct BestFirstSearchInstance<'a, 'b, 'c> {
-    curr_loc: (usize, usize, usize),
-    start_time: usize,
-    dont_occupy: &'c HashSet<(usize, usize, usize)>,
-    distance_grid: &'b Vec<Vec<Vec<i64>>>,
-    max_lookahead: usize,
-    res_sys: &'a HeterogenousReservationSystem,
-    pq: BinaryHeap<Reverse<(usize, usize, usize, (usize, usize, usize))>>,
-    came_from: HashMap<(usize, usize, usize, usize), (usize, usize, usize, usize)>,
-    agent: usize,
-    dont_kickout: HashSet<usize>, //force_kickout: bool
-}
-
-impl<'a, 'b, 'c> BestFirstSearchInstance<'a, 'b, 'c> {
-    fn create_search_instance(
-        res_sys: &'a HeterogenousReservationSystem,
-        distance_grid: &'b Vec<Vec<Vec<i64>>>,
-        curr_loc: (usize, usize, usize),
-        dont_occupy: &'c HashSet<(usize, usize, usize)>,
-        start_time: usize,
-        max_lookahead: usize,
-        agent: usize,
-        dont_kickout: HashSet<usize>,
-    ) -> Self {
-        let mut pq = BinaryHeap::new();
-        pq.push(Reverse((0, 0, start_time, curr_loc.clone())));
-        BestFirstSearchInstance {
-            curr_loc,
-            start_time,
-            dont_occupy,
-            distance_grid,
-            max_lookahead,
-            res_sys,
-            pq,
-            came_from: HashMap::new(),
-            agent,
-            dont_kickout,
-        }
-    }
-
-    fn evaluate_agents_to_kickout(&self, v: &Vec<(usize, usize, usize, usize)>) -> HashSet<usize> {
-        let mut agents_to_kickout = HashSet::new();
-        for &(time, graph, x, y) in v.iter() {
-            let time = self.start_time + time;
-            for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
-                if end_time_info.end_time <= time && *agent != self.agent {
-                    agents_to_kickout.insert(*agent);
-                }
-            }
-
-            let other_nodes: Vec<_> = self
-                .res_sys
-                .collision_checker
-                .get_blocked_nodes(graph, x, y)
-                .iter()
-                .filter(|(g, x, y)| {
-                    self.res_sys.unassigned_agents[*g].len() > *x
-                        && self.res_sys.unassigned_agents[*g][*x].len() > *y
-                })
-                .cloned()
-                .collect();
-            for (graph, x, y) in other_nodes {
-                for (agent, end_time_info) in &self.res_sys.unassigned_agents[graph][x][y] {
-                    if end_time_info.end_time <= time {
-                        agents_to_kickout.insert(*agent);
-                    }
-                }
-            }
-        }
-        agents_to_kickout
-    }
-}
-
-impl<'a, 'b, 'c> Iterator for BestFirstSearchInstance<'a, 'b, 'c> {
-    type Item = ProposedPath;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(Reverse(p)) = self.pq.pop() {
-            let (conf, score, curr_time, (parent_graph, parent_x, parent_y)) = p;
-            if !self
-                .dont_occupy
-                .contains(&(parent_graph, parent_x, parent_y))
-                || (!self
-                    .dont_occupy
-                    .contains(&(parent_graph, parent_x, parent_y))
-                    && self.distance_grid[self.agent][parent_x][parent_y] == 0)
-                || (self.curr_loc == (parent_graph, parent_x, parent_y)
-                    && curr_time > self.start_time + self.max_lookahead)
-            {
-                //println!("Returning {} {}", conf, score);
-                // Backtrack
-                let mut node = (curr_time, parent_graph, parent_x, parent_y);
-                let mut v = vec![node.clone()];
-                while let Some(p) = self.came_from.get(&node) {
-                    v.push(p.clone());
-                    node = *p;
-                }
-                v.reverse();
-
-                let agents_to_kickout = self.evaluate_agents_to_kickout(&v);
-
-                return Some(ProposedPath {
-                    path: v.iter().map(|&(_, graph, x, y)| (graph, x, y)).collect(),
-                    need_to_moveout: agents_to_kickout.iter().cloned().collect(),
-                });
-            }
-
-            if curr_time + 1 > self.start_time + self.max_lookahead
-                || curr_time + 1 >= self.res_sys.occupied.len()
-            {
-                continue;
-            }
-
-            let neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)]
-                .iter()
-                .map(|(dx, dy)| (parent_x as i64 + dx, parent_y as i64 + dy))
-                .filter(|&(x, y)| {
-                    // Bounds check
-                    x >= 0
-                        && y >= 0
-                        && x < (self.distance_grid[self.agent].len() as i64)
-                        && y < (self.distance_grid[self.agent][0].len() as i64)
-                })
-                .map(|(x, y)| (x as usize, y as usize))
-                .filter(|&(x, y)| self.distance_grid[self.agent][x][y] >= 0) // Static obstacles
-                .filter(|&(x, y)| {
-                    //bounds
-                    self.res_sys.occupied[curr_time + 1][parent_graph].len() > x
-                        && self.res_sys.occupied[curr_time + 1][parent_graph][x].len() > y
-                })
-                .filter(|&(x, y)| {
-                    self.res_sys.occupied.len() >= (curr_time + 1)
-                        || (self.res_sys.occupied[curr_time + 1][parent_graph][x][y].len() == 0
-                            && !self.dont_occupy.contains(&(parent_graph, x, y)))
-                }) // Dynamic obstacles
-                /* .filter(|&(x, y)| {
-                    for (agent, _end_time) in &self.res_sys.unassigned_agents[parent_graph][x][y] {
-                        if self.distance_grid[*agent][x][y] == 0 {
-                            return false;
-                        }
-                    }
-                    for (g, x, y) in
-                        self.res_sys
-                            .collision_checker
-                            .get_blocked_nodes(parent_graph, x, y)
-                    {
-                        for (agent, _end_time) in &self.res_sys.unassigned_agents[g][x][y] {
-                            if self.distance_grid[*agent][x][y] == 0 {
-                                return false;
-                            }
-                        }
-                    }
-                    return true;
-                }) // Handle agents at end location*/
-                .filter(|&(x, y)| {
-                    for agent in &self.res_sys.occupied[curr_time][parent_graph][x][y] {
-                        if self.res_sys.occupied[curr_time + 1][parent_graph][p.3.1][p.3.2]
-                            .contains(agent)
-                        {
-                            return false;
-                        }
-                    }
-                    true
-                });
-
-            for (x, y) in neighbors {
-                let tentative_g_score = self.distance_grid[self.agent][x][y].max(0) as usize;
-
-                // Backtrack
-                if self
-                    .came_from
-                    .contains_key(&(curr_time + 1, parent_graph, x, y))
-                {
-                    continue;
-                }
-                self.came_from.insert(
-                    (curr_time + 1, parent_graph, x, y),
-                    (curr_time, parent_graph, p.3.1, p.3.2),
-                );
-                let mut node = (curr_time, parent_graph, x, y);
-                let mut v = vec![node.clone()];
-                while let Some(p) = self.came_from.get(&node) {
-                    v.push(p.clone());
-                    node = *p;
-                }
-                v.reverse();
-
-                let agents_to_kickout = self.evaluate_agents_to_kickout(&v);
-                let mut skip = false;
-                for p in &agents_to_kickout {
-                    if self.dont_kickout.contains(p) {
-                        skip = true;
-                    }
-                }
-
-                if !skip {
-                    self.pq.push(Reverse((
-                        tentative_g_score,
-                        agents_to_kickout.len(),
-                        curr_time + 1,
-                        (parent_graph, x, y),
-                    )));
-                }
-            }
-        }
-        return None;
-    }
-}
-
-/// Heterogenous Agent configuration
-#[derive(Debug, Clone)]
-pub struct HeterogenousAgent {
-    pub graph_id: usize,
-    pub start: (usize, usize),
-    pub end: (usize, usize),
-}
-
-/// Runs breadth first search to evaluate the distance for each agent to its goal
-/// base_obstacles - The obstacle grid base that is true if there is an obstacle false if there isnt
-/// graph_scale - The size of each planning cell for each agent
-/// agents - Each agent's start and goal
-pub fn evaluate_heterogenous_agent_grids(
-    base_obstacles: &Vec<Vec<bool>>,
-    graph_scale: &Vec<f32>,
-    agents: &Vec<HeterogenousAgent>,
-) -> Vec<Vec<Vec<i64>>> {
-    let mut distance_grids = vec![];
-    for agent in agents {
-        let grid = evaluate_individual_agent_cost(base_obstacles, &agent, &graph_scale);
-        distance_grids.push(grid);
-    }
-    distance_grids
-}
-
-/// Runs BFS for an individual agent and returns the cost for each location.
-fn evaluate_individual_agent_cost(
-    base_obstacles: &Vec<Vec<bool>>,
-    agent: &HeterogenousAgent,
-    graph_scale: &Vec<f32>,
-) -> Vec<Vec<i64>> {
-    let width = (((base_obstacles[0].len() as f32) / graph_scale[agent.graph_id]) as usize);
-    let height = (((base_obstacles.len() as f32) / graph_scale[agent.graph_id]) as usize);
-
-    println!("Dimensions: {} x {}", width, height);
-    let mut distance_grid = vec![vec![-5; width]; height];
-
-    for x in 0..base_obstacles.len() {
-        for y in 0..base_obstacles[0].len() {
-            if base_obstacles[x][y] {
-                let x = x as f32;
-                let y = y as f32;
-                let x_idx = (x / graph_scale[agent.graph_id]) as usize;
-                let y_idx = (y / graph_scale[agent.graph_id]) as usize;
-                if x_idx >= distance_grid.len() {
-                    continue;
-                }
-                if y_idx >= distance_grid[x_idx].len() {
-                    continue;
-                }
-                distance_grid[x_idx][y_idx] = -1;
-            }
-        }
-    }
-
-    let mut queue = VecDeque::new();
-    queue.push_back((agent.end, 0));
-    let directions = [(-1, 0), (0, -1), (1, 0), (0, 1)];
-    distance_grid[agent.end.0][agent.end.1] = 0;
-
-    while let Some((node, score)) = queue.pop_front() {
-        let (x, y) = node;
-        let (x, y) = (x as i64, y as i64);
-        for &(dx, dy) in &directions {
-            let nx = x + dx;
-            let ny = y + dy;
-
-            // Check bounds
-            if nx >= 0 && ny >= 0 && nx < width as i64 && ny < height as i64 {
-                let n_usize = (nx as usize, ny as usize);
-                // Check if unvisited
-                if distance_grid[n_usize.0][n_usize.1] == -5 {
-                    queue.push_back((n_usize, score + 1));
-                    distance_grid[n_usize.0][n_usize.1] = score + 1;
-                }
-            }
-        }
-    }
-
-    distance_grid
-}
-
-/// Hack, once an agent reaches its end goal do not move out
-fn recalculate_individual_agent_cost(
-    base_obstacles: &Vec<Vec<bool>>,
-    agent: &HeterogenousAgent,
-    graph_scale: &Vec<f32>,
-    all_agents: &Vec<HeterogenousAgent>,
-    agents_at_goal: &HashSet<usize>,
-) -> Vec<Vec<i64>> {
-    let width = (((base_obstacles[0].len() as f32) / graph_scale[agent.graph_id]) as usize);
-    let height = (((base_obstacles.len() as f32) / graph_scale[agent.graph_id]) as usize);
-
-    let mut distance_grid = vec![vec![-5; width]; height];
-
-    let collision_checker = MultiGridCollisionChecker {
-        grid_sizes: graph_scale.clone(),
-    };
-
-    for x in 0..base_obstacles.len() {
-        for y in 0..base_obstacles[0].len() {
-            if base_obstacles[x][y] {
-                let x = x as f32;
-                let y = y as f32;
-                let x_idx = (x / graph_scale[agent.graph_id]) as usize;
-                let y_idx = (y / graph_scale[agent.graph_id]) as usize;
-                if x_idx >= distance_grid.len() {
-                    continue;
-                }
-                if y_idx >= distance_grid[x_idx].len() {
-                    continue;
-                }
-                distance_grid[x_idx][y_idx] = -1;
-            }
-        }
-    }
-
-    for (agent_id, parked_agent) in all_agents.iter().enumerate() {
-        if !agents_at_goal.contains(&agent_id) {
-            continue;
-        }
-        if parked_agent.graph_id == agent.graph_id {
-            if parked_agent.end.0 >= distance_grid.len() {
-                continue;
-            }
-            if parked_agent.end.1 >= distance_grid[parked_agent.end.0].len() {
-                continue;
-            }
-            distance_grid[parked_agent.end.0][parked_agent.end.1] = -1;
-        }
-        let nodes = collision_checker.get_blocked_nodes(
-            parked_agent.graph_id,
-            parked_agent.end.0,
-            parked_agent.end.1,
-        );
-        for node in nodes {
-            if node.0 == agent.graph_id {
-                if node.1 >= distance_grid.len() {
-                    continue;
-                }
-                if node.2 >= distance_grid[node.1].len() {
-                    continue;
-                }
-                distance_grid[node.1][node.2] = -1;
-            }
-        }
-    }
-
-    let mut queue = VecDeque::new();
-    queue.push_back((agent.end, 0));
-    let directions = [(-1, 0), (0, -1), (1, 0), (0, 1)];
-    distance_grid[agent.end.0][agent.end.1] = 0;
-
-    while let Some((node, score)) = queue.pop_front() {
-        let (x, y) = node;
-        let (x, y) = (x as i64, y as i64);
-        for &(dx, dy) in &directions {
-            let nx = x + dx;
-            let ny = y + dy;
-
-            // Check bounds
-            if nx >= 0 && ny >= 0 && nx < width as i64 && ny < height as i64 {
-                let n_usize = (nx as usize, ny as usize);
-                // Check if unvisited
-                if distance_grid[n_usize.0][n_usize.1] == -5 {
-                    queue.push_back((n_usize, score + 1));
-                    distance_grid[n_usize.0][n_usize.1] = score + 1;
-                }
-            }
-        }
-    }
-
-    distance_grid
-}
-
-/// Heterogenous PiBT using the reasoning module
-pub struct HetPiBT {
-    cost_map: Vec<Vec<Vec<i64>>>,
-    reservation_system: HeterogenousReservationSystem,
-    base_obstacles: Vec<Vec<bool>>,
-    // Hack: This makes sure no wiggles once we reach a destination
-    goal_reached: HashSet<usize>,
-    agents: Vec<HeterogenousAgent>,
-}
-
-impl HetPiBT {
-    pub fn init_solver(
-        base_obstacles: &Vec<Vec<bool>>,
-        graph_scale: Vec<f32>,
-        grid_bounds: Vec<(usize, usize)>,
-        agents: Vec<HeterogenousAgent>,
-    ) -> Self {
-        let cost_map = evaluate_heterogenous_agent_grids(base_obstacles, &graph_scale, &agents);
-        let mut reservation_system =
-            HeterogenousReservationSystem::new(graph_scale, grid_bounds, agents.len());
-        for (agent_id, agent) in agents.iter().enumerate() {
-            let start_traj = HeterogenousTrajectory {
-                graph_id: agent.graph_id,
-                start_time: 0,
-                positions: vec![agent.start],
-            };
-            reservation_system
-                .reserve_trajectory(&start_traj, agent_id)
-                .unwrap();
-        }
-
-        Self {
-            cost_map,
-            reservation_system,
-            goal_reached: HashSet::new(),
-            base_obstacles: base_obstacles.clone(),
-            agents: agents.clone(),
-        }
-    }
-
-    /// Attempt to solve for agent
-    fn attempt_solve_for_agent(&mut self, agent_id: usize, forward_lookup: usize) -> Vec<usize> {
-        let Some(&(graph, x, y)) = self.reservation_system.agent_last_location.get(&agent_id)
-        else {
-            return vec![];
-        };
-        let Some(&end_time) = self.reservation_system.unassigned_agents[graph][x][y].get(&agent_id)
-        else {
-            return vec![];
-        };
-        let time = end_time.end_time;
-
-        let mut stack = VecDeque::new();
-
-        let mut blocked_nodes = HashSet::from_iter([(graph, x, y)].iter().cloned());
-        let search = BestFirstSearchInstance::create_search_instance(
-            &self.reservation_system,
-            &self.cost_map,
-            (graph, x, y),
-            &blocked_nodes,
-            time,
-            forward_lookup,
-            agent_id,
-            self.goal_reached.clone(),
-        );
-        let mut will_affect: HashMap<(usize, ProposedPath), (usize, ProposedPath)> = HashMap::new();
-        for path in search {
-            if path.need_to_moveout.len() > 1 {
-                continue;
-            }
-
-            //println!("Starting agent at {:?}", (graph, x, y));
-            //println!("Pushing path  {:?} for agent {}", path, agent_id);
-            // Hack even though it DFS, we want the earliest node to be expanded to
-            // be the first one generated.
-            stack.push_back((agent_id, blocked_nodes.clone(), forward_lookup, 0, path));
-        }
-
-        while let Some((agent_id, blocked_locations, forward_lookup, depth, neighbour)) =
-            stack.pop_front()
-        {
-            //println!("Expanding agent {} {:?}", agent_id, neighbour);
-            if neighbour.need_to_moveout.len() == 0 {
-                let mut agent = agent_id;
-                let mut path_to_reserve = HeterogenousTrajectory {
-                    graph_id: neighbour.path[0].0,
-                    start_time: end_time.end_time.clone(),
-                    positions: neighbour.path.iter().map(|&(_, x, y)| (x, y)).collect(),
-                };
-
-                //println!("Agent {}", agent);
-                //println!("{:?}", path_to_reserve);
-                //println!("First path for agent {}: {:?}", agent_id, path_to_reserve);
-
-                while let Err(e) = self
-                    .reservation_system
-                    .reserve_trajectory(&path_to_reserve, agent)
-                {
-                    //println!("Delaying {:?}", e);
-                    path_to_reserve.start_time += 1;
-                }
-
-                // Cascade the delays back up the chain
-                //println!("will_affect: {:?}", will_affect);
-                let mut path_to_study = neighbour.clone();
-                //panic!("");
-                while let Some((agent_id, path)) = will_affect.get(&(agent, path_to_study)) {
-                    agent = *agent_id;
-                    // println!("Setting {:?} {:?}", agent, path);
-                    path_to_study = path.clone();
-                    //panic!("");
-                    let mut hypot_path = HeterogenousTrajectory {
-                        graph_id: path.path[0].0,
-                        start_time: path_to_reserve.start_time + 1,
-                        positions: path.path.iter().map(|&(_, x, y)| (x, y)).collect(),
-                    };
-                    while let Err(e) = self
-                        .reservation_system
-                        .reserve_trajectory(&hypot_path, agent)
-                    {
-                        //println!("Delaying {:?}", e);
-                        hypot_path.start_time += 1;
-                    }
-                    //println!("Chosen path for agent {}: {:?}", path.need_to_moveout[0], hypot_path);
-                }
-                return vec![];
-            }
-
-            //println!("Exploring path for {}, {}", agent_id, depth);
-            let mut c = blocked_locations.clone();
-            for &p in &neighbour.path {
-                c.insert(p);
-                for blocked_node in self
-                    .reservation_system
-                    .collision_checker
-                    .get_blocked_nodes(p.0, p.1, p.2)
-                {
-                    c.insert(blocked_node);
-                }
-            }
-
-            if will_affect.contains_key(&(agent_id, neighbour.clone()))
-                || neighbour.need_to_moveout.len() > 1
-            {
-                // Deadlock. Do not proceed
-                println!("Deadlock");
-                continue;
-            }
-
-            let my_size = self.reservation_system.collision_checker.grid_sizes
-                [self.reservation_system.agent_to_graph[agent_id].unwrap()];
-            let other_size = self.reservation_system.collision_checker.grid_sizes
-                [self.reservation_system.agent_to_graph[neighbour.need_to_moveout[0]].unwrap()];
-            let mut forward_lookup = forward_lookup;
-            if other_size < my_size {
-                let factor = (my_size / other_size).round() as usize;
-                forward_lookup *= factor * factor;
-                println!("Forward lookup {:?}", forward_lookup);
-                forward_lookup = forward_lookup.max(15);
-            }
-            let Some(p) = self
-                .reservation_system
-                .agent_last_location
-                .get(&neighbour.need_to_moveout[0])
-            else {
-                continue;
-            };
-
-            let Some(end_time) = self.reservation_system.unassigned_agents[p.0][p.1][p.2]
-                .get(&neighbour.need_to_moveout[0])
-            else {
-                continue;
-            };
-
-            println!("pos: {:?} {:?} {}", p, c, forward_lookup);
-            // Try to get the robot to move out
-            let search = BestFirstSearchInstance::create_search_instance(
-                &self.reservation_system,
-                &self.cost_map,
-                *p,
-                &c,
-                end_time.end_time,
-                forward_lookup,
-                neighbour.need_to_moveout[0],
-                self.goal_reached.clone(),
-            );
-            let mut v: Vec<_> = search.collect();
-            //v.reverse();
-            for path in v {
-                println!("{:?}", path);
-                if path.need_to_moveout.len() > 1 {
-                    continue;
-                }
-
-                if will_affect.contains_key(&(agent_id, neighbour.clone())) {
-                    //Deadlock
-                    continue;
-                }
-
-                will_affect.insert(
-                    (neighbour.need_to_moveout[0], path.clone()),
-                    (agent_id, neighbour.clone()),
-                );
-                println!(
-                    "Adding path for {} {:?}",
-                    neighbour.need_to_moveout[0], path
-                );
-                stack.push_front((
-                    neighbour.need_to_moveout[0],
-                    c.clone(),
-                    forward_lookup,
-                    depth + 1,
-                    path,
-                ));
-            }
-        }
-        let path_to_reserve = HeterogenousTrajectory {
-            graph_id: graph,
-            start_time: end_time.end_time.clone(),
-            positions: vec![(x, y)],
-        };
-        let Ok(Some(p)) = self
-            .reservation_system
-            .reserve_trajectory(&path_to_reserve, agent_id)
-        else {
-            return vec![];
-        };
-        return vec![p];
-    }
-
-    pub fn solve(&mut self, max_time_steps: usize) -> Option<usize> {
-        let mut agent_priorities: Vec<_> = (0..self.reservation_system.max_agents)
-            .map(|p| {
-                let Some(&(graph, x, y)) = self.reservation_system.agent_last_location.get(&p)
-                else {
-                    panic!("Solver was not properly initiallized");
-                };
-                if self.cost_map[p][x][y] != 0{
-                Some((
-                    (self.cost_map[p][x][y] as f32) / self.cost_map[p].len() as f32 /*+ rand::random::<f32>()*0.1*/,
-                    p,
-                ))
-                }
-                else {
-                    Some((0.0,p))
-                }
-            })
-            .collect();
-
-        // Hashmap tracks agent priority.
-        let mut last_prio: HashMap<_, _> = agent_priorities
+        let initial_position: Vec<_> = starts
             .iter()
-            .enumerate()
-            .filter(|p| p.1.is_some())
-            .map(|(ind, opt)| {
-                let (_, b) = opt.unwrap();
-                (b, ind)
+            .map(|(x, y)| bitmap.get_polygon_at(*x, *y, &self.nav_graph))
+            .collect();
+        let final_position: Vec<_> = ends
+            .iter()
+            .map(|(x, y)| bitmap.get_polygon_at(*x, *y, &self.nav_graph))
+            .collect();
+
+        // TODO(arjoc): return an error
+        self.ends = final_position.iter().map(|p| p.unwrap()).collect();
+
+        for (agent, node) in initial_position.iter().enumerate() {
+            let Some(node) = node else {
+                continue;
+            };
+            self.occupied_now[*node] = Some(agent);
+        }
+
+        self.q.push(initial_position.clone());
+        self.q
+            .extend((1..max_time).map(|_| vec![None; agents.len()]));
+
+        let mut priorities: Vec<_> = (0..starts.len())
+            .map(|agent| {
+                self.distance_matrix.matrix[initial_position[agent].unwrap()]
+                    [final_position[agent].unwrap()]
             })
             .collect();
-        for step in 1..max_time_steps {
-            let agents = 0..self.reservation_system.max_agents;
-            let mut flg_fin = true;
-            let mut checked = false;
-            println!("===========================================");
-            println!("Step {:?}", step);
-            let mut needs_recalculation = false;
+        for t in 1..max_time - 1 {
+            agents.sort_by(|p, q| priorities[*q].cmp(&priorities[*p]));
+            for agent in &agents {
+                if self.q[t][*agent] != None {
+                    continue;
+                }
 
-            self.reservation_system.extend_by_one_timestep();
-            for a in agents {
-                let agent = self
-                    .reservation_system
-                    .get_agent_last_alloc_time(a)
-                    .unwrap();
+                self.pibt(*agent, t - 1);
+            }
 
-                checked = true;
-                let cost = self.cost_map[a][agent.x][agent.y];
-                //println!("cost at current step {}", cost);
-                let Some(&idx) = last_prio.get(&a) else {
-                    panic!("Could not find ");
-                };
-                let Some(x) = agent_priorities[idx].as_mut() else {
-                    panic!("Failed to calculate cost");
-                };
-
-                // For debugging
-                assert!(x.1 == a);
-
-                //println!("Priority at current step {:?} for {}", x, a);
-                if cost == 0 {
-                    if !self.goal_reached.contains(&x.1) {
-                        self.goal_reached.insert(x.1);
-                        needs_recalculation = true;
-                        println!("{} Reached end point", x.1);
-                    }
-                    x.0 = 0.00;
+            for agent in 0..starts.len() {
+                if self.q[t][agent] != Some(self.ends[agent]) {
+                    priorities[agent] += 1;
                 } else {
-                    x.0 += 1.0 /*+ rand::random::<f32>()*0.1*/;
-                    flg_fin = false;
+                    priorities[agent] = 0;
                 }
-            }
-            if !checked {
-                continue;
-            }
-            if flg_fin {
-                return Some(step);
             }
 
-            if needs_recalculation {
-                for agent in 0..self.reservation_system.max_agents {
-                    if self.goal_reached.contains(&agent) {
-                        continue;
-                    }
-                    let p = recalculate_individual_agent_cost(
-                        &self.base_obstacles,
-                        &self.agents[agent],
-                        &self.reservation_system.collision_checker.grid_sizes,
-                        &self.agents,
-                        &self.goal_reached,
-                    );
-                    self.cost_map[agent] = p;
-                }
-            }
-            agent_priorities.sort_by(|a, b| {
-                let Some(a) = a else {
-                    let Some(b) = b else {
-                        return Ordering::Equal;
-                    };
-                    return Ordering::Greater;
-                };
+            self.occupied_now = self.occupied_nxt.clone();
+            self.occupied_nxt = vec![None; self.occupied_nxt.len()];
 
-                let Some(b) = b else {
-                    return Ordering::Less;
-                };
-                a.partial_cmp(b).unwrap()
-            });
-
-            last_prio = agent_priorities
-                .iter()
-                .enumerate()
-                .filter(|p| p.1.is_some())
-                .map(|(ind, opt)| {
-                    let (_, b) = opt.unwrap();
-                    (b, ind)
-                })
-                .collect();
-            for &agent in &agent_priorities {
-                let Some((_cost, agent_id)) = agent else {
-                    continue;
-                };
-                if self.goal_reached.contains(&agent_id) {
-                    continue;
+            if self.is_solution(t) {
+                for i in 0..=t {
+                    final_trajectory.push(
+                        self.q[i]
+                            .iter()
+                            .map(|p| {
+                                if let Some(p) = p {
+                                    self.nav_graph.polygon_centroid(*p).unwrap()
+                                } else {
+                                    (-1.0, -1.0)
+                                }
+                            })
+                            .collect(),
+                    )
                 }
-                let last_time = self
-                    .reservation_system
-                    .get_agent_last_alloc_time(agent_id)
-                    .unwrap();
-                if last_time.end_time > step {
-                    continue;
-                }
-                self.attempt_solve_for_agent(agent_id, 1);
+                break;
             }
         }
-        None
-    }
 
-    pub fn get_trajectories(&self, time_step: usize) -> Vec<Option<(usize, usize, usize)>> {
-        self.reservation_system.get_agents_at_timestep(time_step)
+        final_trajectory
     }
 }
 
 #[cfg(test)]
-#[test]
-fn test_best_first_search() {
-    use std::collections::hash_set;
+mod tests {
+    use super::*;
 
-    let base_obstacles = vec![
-        vec![false, false, false, false],
-        vec![false, false, false, false],
-        vec![false; 4],
-        vec![false; 4],
-    ];
-    let grid_bounds = vec![(4, 4), (2, 2)];
-    let mut graph_scale = vec![1.0, 2.0];
-    let agent1 = HeterogenousAgent {
-        graph_id: 0,
-        start: (0, 3),
-        end: (3, 3),
-    };
-    let agent2 = HeterogenousAgent {
-        graph_id: 1,
-        start: (0, 0),
-        end: (0, 1),
-    };
-    let agents = vec![agent1, agent2];
-    let mut het_pibt = HetPiBT::init_solver(&base_obstacles, graph_scale, grid_bounds, agents);
-    het_pibt.reservation_system.extend_by_one_timestep();
-    //het_pibt.attempt_solve_for_agent(1,1);
+    #[test]
+    fn test_generate_grid_empty() {
+        let nav0 = generate_grid((0.0, 0.0), 20.0, 0, 0);
+        assert_eq!(nav0.polygons.len(), 0);
+        let nav1 = generate_grid((0.0, 0.0), 20.0, 5, 0);
+        assert_eq!(nav1.polygons.len(), 0);
+        let nav2 = generate_grid((0.0, 0.0), 20.0, 0, 5);
+        assert_eq!(nav2.polygons.len(), 0);
+    }
 
-    let blocked = HashSet::from_iter([(1, 0, 0)].iter().cloned());
-    let search = BestFirstSearchInstance::create_search_instance(
-        &het_pibt.reservation_system,
-        &het_pibt.cost_map,
-        (1, 0, 0),
-        &blocked,
-        0,
-        1,
-        1,
-        HashSet::new(),
-    );
-    let paths: Vec<_> = search.collect();
-    println!("{:?}", paths);
-    assert_eq!(paths.len(), 2);
-    // Best case we try to move near the goal forcing the blocking agent out
-    assert_eq!(paths[0].path, vec![(1, 0, 0), (1, 0, 1)]);
-    // assert_eq!(paths[2].path, vec![(1, 0, 0), (1, 0, 0)]);
-    assert_eq!(paths[1].path, vec![(1, 0, 0), (1, 1, 0)]);
-    assert_eq!(paths[0].need_to_moveout, [0]);
-    assert_eq!(paths[1].need_to_moveout, []);
+    #[test]
+    fn test_generate_grid_structure() {
+        let width = 3;
+        let height = 4;
+        let grid_size = 10.0;
+        let nav = generate_grid((0.0, 0.0), grid_size, width, height);
+        assert_eq!(nav.polygons.len(), width * height);
+
+        for i in 0..width {
+            for j in 0..height {
+                let id = i * height + j;
+                let expected_centroid =
+                    ((i as f32 + 0.5) * grid_size, (j as f32 + 0.5) * grid_size);
+                assert!((nav.polygons[id].centroid.0 - expected_centroid.0).abs() < 1e-5);
+                assert!((nav.polygons[id].centroid.1 - expected_centroid.1).abs() < 1e-5);
+
+                let mut expected_neighbors = 0;
+                if i > 0 {
+                    expected_neighbors += 1;
+                }
+                if i + 1 < width {
+                    expected_neighbors += 1;
+                }
+                if j > 0 {
+                    expected_neighbors += 1;
+                }
+                if j + 1 < height {
+                    expected_neighbors += 1;
+                }
+                assert_eq!(nav.connections[id].len(), expected_neighbors);
+            }
+        }
+    }
+
+    #[test]
+    fn test_distance_matrix_correctness() {
+        let width = 5;
+        let height = 5;
+        let nav = generate_grid((0.0, 0.0), 10.0, width, height);
+        let dm = DistanceMatrix::from(&nav);
+
+        for i1 in 0..width {
+            for j1 in 0..height {
+                let u = i1 * height + j1;
+                for i2 in 0..width {
+                    for j2 in 0..height {
+                        let v = i2 * height + j2;
+                        let expected = (i1.abs_diff(i2) + j1.abs_diff(j2)) as i32;
+                        assert_eq!(
+                            dm.matrix[u][v], expected,
+                            "Distance between ({i1},{j1}) and ({i2},{j2}) should match Manhattan distance"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_distance_matrix_performance() {
+        let width = 30;
+        let height = 30;
+        let nav = generate_grid((0.0, 0.0), 10.0, width, height);
+        let start = std::time::Instant::now();
+        let dm = DistanceMatrix::from(&nav);
+        let elapsed = start.elapsed();
+        println!("DistanceMatrix for 30x30 (900 nodes) took: {:?}", elapsed);
+        assert_eq!(dm.matrix.len(), width * height);
+        assert_eq!(
+            dm.matrix[0][width * height - 1],
+            (width - 1 + height - 1) as i32
+        );
+        assert!(elapsed.as_millis() < 100);
+    }
+
+    #[test]
+    fn test_polygon_contains_point_and_boundary() {
+        let rect = Polygon::rectangle(10.0, 20.0, 30.0, 40.0);
+        // Inside
+        assert!(rect.contains_point((20.0, 35.0)));
+        assert!(rect.contains_point((11.0, 21.0)));
+        assert!(rect.contains_point((39.0, 59.0)));
+
+        // Outside
+        assert!(!rect.contains_point((5.0, 35.0)));
+        assert!(!rect.contains_point((45.0, 35.0)));
+        assert!(!rect.contains_point((20.0, 15.0)));
+        assert!(!rect.contains_point((20.0, 65.0)));
+
+        // Distance to boundary
+        assert!(rect.distance_to_boundary((10.0, 35.0)) < 1e-4);
+        assert!((rect.distance_to_boundary((20.0, 35.0)) - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_polygon_centroid_computation() {
+        // Triangle with known centroid at (10, 10)
+        let tri = Polygon::from_vertices(vec![(0.0, 0.0), (30.0, 0.0), (0.0, 30.0)]);
+        assert!((tri.centroid.0 - 10.0).abs() < 1e-4);
+        assert!((tri.centroid.1 - 10.0).abs() < 1e-4);
+
+        // Rectangle with centroid at (25, 40)
+        let rect = Polygon::rectangle(10.0, 20.0, 30.0, 40.0);
+        assert!((rect.centroid.0 - 25.0).abs() < 1e-4);
+        assert!((rect.centroid.1 - 40.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_segment_intersects_aabb() {
+        // AABB [10, 20] x [10, 20]
+        assert!(segment_intersects_aabb(
+            (0.0, 15.0),
+            (30.0, 15.0),
+            10.0,
+            10.0,
+            20.0,
+            20.0
+        ));
+        assert!(segment_intersects_aabb(
+            (12.0, 12.0),
+            (18.0, 18.0),
+            10.0,
+            10.0,
+            20.0,
+            20.0
+        ));
+        assert!(!segment_intersects_aabb(
+            (0.0, 5.0),
+            (30.0, 5.0),
+            10.0,
+            10.0,
+            20.0,
+            20.0
+        ));
+        assert!(!segment_intersects_aabb(
+            (0.0, 0.0),
+            (5.0, 5.0),
+            10.0,
+            10.0,
+            20.0,
+            20.0
+        ));
+    }
+
+    #[test]
+    fn test_bitmap_grid_point_to_polygon_and_back_uniform() {
+        let width = 4;
+        let height = 4;
+        let grid_size = 20.0;
+        let nav = generate_grid((0.0, 0.0), grid_size, width, height);
+
+        // Fixed resolution of 4.0 world units per cell
+        let bitmap = nav.build_bitmap_grid(4.0);
+
+        // For each node in the grid, test points inside and test centroid round-trip
+        for i in 0..width {
+            for j in 0..height {
+                let id = i * height + j;
+                let centroid = nav.polygons[id].centroid;
+
+                // 1. Back: polygon_id -> (x, y) location (centroid)
+                let pt_back = bitmap.polygon_to_point(&nav, id);
+                assert_eq!(pt_back, Some(centroid));
+
+                // 2. Going: (x, y) centroid -> polygon_id
+                let mapped_poly = bitmap.get_polygon_at(centroid.0, centroid.1, &nav);
+                assert_eq!(mapped_poly, Some(id));
+
+                // 3. Test arbitrary points inside this polygon
+                let test_pts = [
+                    (centroid.0 - 5.0, centroid.1 - 5.0),
+                    (centroid.0 + 7.0, centroid.1 - 3.0),
+                    (centroid.0 - 2.0, centroid.1 + 8.0),
+                ];
+                for pt in test_pts {
+                    let res = bitmap.get_polygon_at(pt.0, pt.1, &nav);
+                    assert_eq!(
+                        res,
+                        Some(id),
+                        "Point ({}, {}) should map to polygon {}",
+                        pt.0,
+                        pt.1,
+                        id
+                    );
+                }
+            }
+        }
+
+        // Test points outside the grid bounds
+        assert_eq!(bitmap.get_polygon_at(-10.0, 10.0, &nav), None);
+        assert_eq!(bitmap.get_polygon_at(10.0, -10.0, &nav), None);
+        assert_eq!(bitmap.get_polygon_at(200.0, 200.0, &nav), None);
+    }
+
+    #[test]
+    fn test_bitmap_grid_non_uniform_navmesh() {
+        let nav = generate_non_uniform_navmesh();
+        let resolution = 2.0;
+        let bitmap = nav.build_bitmap_grid(resolution);
+
+        // Verify each non-uniform polygon can be reached from internal points and round-tripped
+        for (id, poly) in nav.polygons.iter().enumerate() {
+            // Centroid maps to this polygon
+            let mapped_centroid = bitmap.get_polygon_at(poly.centroid.0, poly.centroid.1, &nav);
+            assert_eq!(
+                mapped_centroid,
+                Some(id),
+                "Centroid of polygon {} should map to itself",
+                id
+            );
+
+            // Centroid lookup from polygon ID
+            let centroid_back = bitmap.polygon_to_point(&nav, id);
+            assert_eq!(centroid_back, Some(poly.centroid));
+        }
+
+        // Specific point checks:
+        // Inside Node 0 (Large Central Hall: 180..320, 140..230)
+        assert_eq!(bitmap.get_polygon_at(220.0, 180.0, &nav), Some(0));
+
+        // Inside Node 1 (West Room: 60..130, 150..220)
+        assert_eq!(bitmap.get_polygon_at(80.0, 170.0, &nav), Some(1));
+
+        // Inside Node 2 (West Corridor: 130..180, 170..200)
+        assert_eq!(bitmap.get_polygon_at(150.0, 185.0, &nav), Some(2));
+
+        // Inside Node 3 (North Office: 205..295, 50..100)
+        assert_eq!(bitmap.get_polygon_at(250.0, 75.0, &nav), Some(3));
+
+        // Inside Node 7 (South Triangle: centroid around (250, 256.7))
+        assert_eq!(bitmap.get_polygon_at(250.0, 250.0, &nav), Some(7));
+
+        // Unoccupied space outside the navmesh
+        assert_eq!(bitmap.get_polygon_at(10.0, 10.0, &nav), None);
+        assert_eq!(bitmap.get_polygon_at(500.0, 500.0, &nav), None);
+        assert_eq!(bitmap.get_polygon_at(100.0, 100.0, &nav), None);
+    }
+
+    #[test]
+    fn test_bitmap_grid_performance() {
+        let width = 25;
+        let height = 25;
+        let grid_size = 20.0;
+        let nav = generate_grid((0.0, 0.0), grid_size, width, height);
+
+        let build_start = std::time::Instant::now();
+        let bitmap = nav.build_bitmap_grid(2.0);
+        let build_time = build_start.elapsed();
+        println!(
+            "Bitmap grid build ({}x{} cells, 625 polygons) took: {:?}",
+            bitmap.width, bitmap.height, build_time
+        );
+        assert!(build_time.as_millis() < 200);
+
+        // Perform 50,000 arbitrary point lookups
+        let query_start = std::time::Instant::now();
+        let num_queries = 50_000;
+        let mut found_count = 0;
+
+        for k in 0..num_queries {
+            let x = ((k * 37) % 550) as f32 - 25.0;
+            let y = ((k * 43) % 550) as f32 - 25.0;
+            if bitmap.get_polygon_at(x, y, &nav).is_some() {
+                found_count += 1;
+            }
+        }
+
+        let query_time = query_start.elapsed();
+        println!(
+            "{} arbitrary point queries took: {:?} ({:?} / query)",
+            num_queries,
+            query_time,
+            query_time / num_queries as u32
+        );
+
+        assert!(found_count > 0);
+        // Ensure average query time is well under 10 microseconds (typically ~100ns)
+        assert!(query_time.as_millis() < 250);
+    }
+
+    #[test]
+    fn test_bitmap_grid_serde() {
+        let nav = generate_non_uniform_navmesh();
+        let bitmap = nav.build_bitmap_grid(5.0);
+
+        let json = serde_json::to_string(&bitmap).expect("Should serialize bitmap");
+        let deserialized: PolygonBitmapGrid =
+            serde_json::from_str(&json).expect("Should deserialize bitmap");
+
+        assert_eq!(bitmap.width, deserialized.width);
+        assert_eq!(bitmap.height, deserialized.height);
+        assert_eq!(bitmap.resolution, deserialized.resolution);
+        assert_eq!(bitmap.cells, deserialized.cells);
+    }
+
+    #[test]
+    fn test_highway_with_dropoffs_topology_and_pibt() {
+        let nav = generate_highway_with_dropoffs((292.0, 90.0), 60.0);
+        // 3x7 center highway (21 nodes) + 3 left drop-offs + 3 right drop-offs = 27 nodes
+        assert_eq!(nav.polygons.len(), 27);
+
+        // Each drop-off node (21..27) should have degree 1
+        for dropoff_id in 21..27 {
+            assert_eq!(nav.connections[dropoff_id].len(), 1);
+        }
+
+        let starts = vec![
+            nav.polygons[21].centroid,
+            nav.polygons[22].centroid,
+            nav.polygons[23].centroid,
+            nav.polygons[24].centroid,
+            nav.polygons[25].centroid,
+            nav.polygons[26].centroid,
+        ];
+        let ends = vec![
+            nav.polygons[26].centroid,
+            nav.polygons[25].centroid,
+            nav.polygons[24].centroid,
+            nav.polygons[23].centroid,
+            nav.polygons[22].centroid,
+            nav.polygons[21].centroid,
+        ];
+
+        let mut solver = PIBTOverNavGraph::init(nav.clone());
+        let trajectories = solver.solve(starts.clone(), ends.clone(), 50);
+        assert!(
+            !trajectories.is_empty(),
+            "PIBT should find a valid trajectory on the highway topology"
+        );
+        assert_eq!(trajectories.first().unwrap(), &starts);
+        assert_eq!(trajectories.last().unwrap(), &ends);
+
+        // Verify no vertex or swap conflicts across all timesteps
+        for t in 0..trajectories.len() {
+            for a1 in 0..starts.len() {
+                for a2 in (a1 + 1)..starts.len() {
+                    assert_ne!(
+                        trajectories[t][a1], trajectories[t][a2],
+                        "Vertex conflict at t={t} between agents {a1} and {a2}"
+                    );
+                    if t + 1 < trajectories.len() {
+                        assert!(
+                            !(trajectories[t][a1] == trajectories[t + 1][a2]
+                                && trajectories[t][a2] == trajectories[t + 1][a1]),
+                            "Swap conflict at t={t}->{t1} between agents {a1} and {a2}",
+                            t1 = t + 1
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
