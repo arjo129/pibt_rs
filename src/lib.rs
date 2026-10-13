@@ -2,6 +2,9 @@ use ::rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
 
+pub mod external_tracks_pibt;
+pub use external_tracks_pibt::PiBTWithExternalTracks;
+
 /// Geometry utility: computes the centroid of a 2D polygon from its vertices.
 /// Uses the standard polygon signed area formula; falls back to the vertex average
 /// for degenerate or collinear polygons.
@@ -356,6 +359,99 @@ impl NavGraph {
     pub fn add_edge(&mut self, n1: usize, n2: usize, guide: GuidePreference) {
         self.connections[n1].push((n2, guide));
         self.connections[n2].push((n1, guide.opposite()));
+    }
+
+    /// Returns true if an edge exists between `n1` and `n2`.
+    pub fn has_edge(&self, n1: usize, n2: usize) -> bool {
+        if n1 >= self.connections.len() || n2 >= self.connections.len() {
+            return false;
+        }
+        self.connections[n1].iter().any(|&(v, _)| v == n2)
+    }
+
+    /// Removes the bidirectional edge between `n1` and `n2`.
+    /// Returns `true` if an edge existed and was removed, `false` otherwise.
+    pub fn remove_edge(&mut self, n1: usize, n2: usize) -> bool {
+        if n1 >= self.connections.len() || n2 >= self.connections.len() {
+            return false;
+        }
+        let len1_before = self.connections[n1].len();
+        self.connections[n1].retain(|&(v, _)| v != n2);
+        let removed1 = self.connections[n1].len() < len1_before;
+
+        let len2_before = self.connections[n2].len();
+        self.connections[n2].retain(|&(v, _)| v != n1);
+        let removed2 = self.connections[n2].len() < len2_before;
+
+        removed1 || removed2
+    }
+
+    /// Removes all edges incident to `node_id` without removing the polygon itself,
+    /// preserving all existing node indices in the `NavGraph`.
+    /// Returns `true` if `node_id` is a valid node index.
+    pub fn disconnect_node(&mut self, node_id: usize) -> bool {
+        if node_id >= self.polygons.len() {
+            return false;
+        }
+        self.connections[node_id].clear();
+        for neighbors in &mut self.connections {
+            neighbors.retain(|&(v, _)| v != node_id);
+        }
+        true
+    }
+
+    /// Removes `node_id` and all its incident edges from the `NavGraph`,
+    /// reindexing all higher node IDs (`> node_id`) down by 1.
+    /// Returns the removed `Polygon` if `node_id` was valid, or `None` if out of bounds.
+    pub fn remove_node(&mut self, node_id: usize) -> Option<Polygon> {
+        if node_id >= self.polygons.len() {
+            return None;
+        }
+        let removed_polygon = self.polygons.remove(node_id);
+        self.connections.remove(node_id);
+
+        for neighbors in &mut self.connections {
+            neighbors.retain(|&(v, _)| v != node_id);
+            for (v, _) in neighbors.iter_mut() {
+                if *v > node_id {
+                    *v -= 1;
+                }
+            }
+        }
+
+        Some(removed_polygon)
+    }
+
+    /// Removes multiple nodes by their current indices in one batch operation,
+    /// handling index shifts automatically by removing in descending index order.
+    /// Returns the removed `Polygon`s in the order they were removed (descending index order).
+    pub fn remove_nodes(&mut self, node_ids: &[usize]) -> Vec<Polygon> {
+        let mut sorted_ids: Vec<usize> = node_ids
+            .iter()
+            .copied()
+            .filter(|&id| id < self.polygons.len())
+            .collect();
+        sorted_ids.sort_unstable();
+        sorted_ids.dedup();
+
+        let mut removed = Vec::with_capacity(sorted_ids.len());
+        for &id in sorted_ids.iter().rev() {
+            if let Some(poly) = self.remove_node(id) {
+                removed.push(poly);
+            }
+        }
+        removed
+    }
+
+    /// Finds the index of the first polygon containing world point `(x, y)`.
+    pub fn find_node_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.polygons.iter().position(|p| p.contains_point((x, y)))
+    }
+
+    /// Removes the polygon containing world point `(x, y)` and all its incident edges.
+    pub fn remove_node_at(&mut self, x: f32, y: f32) -> Option<Polygon> {
+        let node_id = self.find_node_at(x, y)?;
+        self.remove_node(node_id)
     }
 
     /// Going back: maps a specific polygon index to its centroid (x, y) location.
@@ -911,6 +1007,7 @@ impl PIBTOverNavGraph {
         if q_from == goal_node {
             neighbors.push((q_from, GuidePreference::NONE));
         }
+        neighbors.retain(|&(node_id, _)| self.distance_matrix.matrix[node_id][goal_node] >= 0);
         neighbors.shuffle(&mut self.rng);
 
         neighbors.sort_by(|pos1, pos2| {
@@ -1424,6 +1521,86 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_remove_edge_and_disconnect_node() {
+        let mut nav = generate_grid((0.0, 0.0), 10.0, 3, 3);
+        // Node 0 is connected to Node 1 and Node 3
+        assert!(nav.has_edge(0, 1));
+        assert!(nav.has_edge(1, 0));
+        assert!(!nav.has_edge(0, 8));
+
+        // Remove edge (0, 1)
+        assert!(nav.remove_edge(0, 1));
+        assert!(!nav.has_edge(0, 1));
+        assert!(!nav.has_edge(1, 0));
+        // Removing again returns false
+        assert!(!nav.remove_edge(0, 1));
+
+        // Disconnect center node 4 (connected to 1, 3, 5, 7)
+        assert_eq!(nav.connections[4].len(), 4);
+        assert!(nav.disconnect_node(4));
+        assert_eq!(nav.connections[4].len(), 0);
+        assert!(!nav.has_edge(1, 4));
+        assert!(!nav.has_edge(3, 4));
+        assert!(!nav.has_edge(5, 4));
+        assert!(!nav.has_edge(7, 4));
+        // Polygon count is unchanged
+        assert_eq!(nav.polygons.len(), 9);
+    }
+
+    #[test]
+    fn test_remove_node_and_remove_nodes() {
+        let mut nav = generate_grid((0.0, 0.0), 10.0, 3, 3);
+        let center_centroid = nav.polygons[4].centroid;
+        let last_centroid = nav.polygons[8].centroid;
+
+        // Remove center node (index 4)
+        let removed = nav.remove_node(4).expect("Should remove node 4");
+        assert_eq!(removed.centroid, center_centroid);
+        assert_eq!(nav.polygons.len(), 8);
+        assert_eq!(nav.connections.len(), 8);
+        // Old node 8 is now at index 7
+        assert_eq!(nav.polygons[7].centroid, last_centroid);
+
+        // Verify all connection indices are within 0..8
+        for neighbors in &nav.connections {
+            for &(v, _) in neighbors {
+                assert!(v < nav.polygons.len());
+            }
+        }
+
+        // Remove by world coordinate
+        let removed_at = nav
+            .remove_node_at(last_centroid.0, last_centroid.1)
+            .expect("Should remove node at last_centroid");
+        assert_eq!(removed_at.centroid, last_centroid);
+        assert_eq!(nav.polygons.len(), 7);
+
+        // Batch remove multiple nodes
+        let batch_removed = nav.remove_nodes(&[0, 2, 5]);
+        assert_eq!(batch_removed.len(), 3);
+        assert_eq!(nav.polygons.len(), 4);
+        for neighbors in &nav.connections {
+            for &(v, _) in neighbors {
+                assert!(v < nav.polygons.len());
+            }
+        }
+
+        // Verify PIBT still routes around removed center node on a 3x3 grid
+        let mut nav_with_hole = generate_grid((0.0, 0.0), 20.0, 3, 3);
+        let start_pt = nav_with_hole.polygons[0].centroid;
+        let end_pt = nav_with_hole.polygons[8].centroid;
+        let hole_centroid = nav_with_hole.polygons[4].centroid;
+        nav_with_hole.remove_node(4);
+
+        let mut solver = PIBTOverNavGraph::init(nav_with_hole);
+        let traj = solver.solve(vec![start_pt], vec![end_pt], 20);
+        assert!(!traj.is_empty());
+        for step in &traj {
+            assert_ne!(step[0], hole_centroid);
         }
     }
 }
